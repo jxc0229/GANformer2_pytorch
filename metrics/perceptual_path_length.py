@@ -1,89 +1,118 @@
-# Perceptual Path Length (PPL)
+﻿# Compute the Perceptual Path Length (PPL) metric
+
+import copy
 import numpy as np
-import tensorflow as tf
-import dnnlib.tflib as tflib
+import torch
+import dnnlib
+from . import metric_utils
 
-from metrics import metric_base
-from training import misc
+#----------------------------------------------------------------------------
 
-class PPL(metric_base.MetricBase):
-    def __init__(self, num_samples, epsilon, space, sampling, crop, batch_per_gpu, Gs_overrides, **kwargs):
+# Spherical interpolation of a batch of vectors
+def slerp(a, b, t):
+    a = a / a.norm(dim=-1, keepdim = True)
+    b = b / b.norm(dim=-1, keepdim = True)
+    d = (a * b).sum(dim=-1, keepdim = True)
+    p = t * torch.acos(d)
+    c = b - d * a
+    c = c / c.norm(dim=-1, keepdim = True)
+    d = a * torch.cos(p) + c * torch.sin(p)
+    d = d / d.norm(dim=-1, keepdim = True)
+    return d
+
+#----------------------------------------------------------------------------
+
+class PPLSampler(torch.nn.Module):
+    def __init__(self, G, G_kwargs, epsilon, space, sampling, crop, vgg16):
         assert space in ["z", "w"]
         assert sampling in ["full", "end"]
-        super().__init__(**kwargs)
-        self.num_samples = num_samples
+        super().__init__()
+        self.G = copy.deepcopy(G)
+        self.G_kwargs = G_kwargs
         self.epsilon = epsilon
         self.space = space
         self.sampling = sampling
         self.crop = crop
-        self.batch_per_gpu = batch_per_gpu
-        self.Gs_overrides = Gs_overrides
+        self.vgg16 = copy.deepcopy(vgg16)
 
-    def _evaluate(self, Gs, Gs_kwargs, num_gpus, **kwargs):
-        Gs_kwargs = dict(Gs_kwargs)
-        Gs_kwargs.update(self.Gs_overrides)
-        batch_size = num_gpus * self.batch_per_gpu
+    def forward(self, c):
+        # Generate random latents and interpolation t-values
+        t = torch.rand([c.shape[0]], device = c.device) * (1 if self.sampling == "full" else 0)
+        z0, z1 = torch.randn([c.shape[0] * 2, *self.G.input_shape[1:]], device = c.device).chunk(2)
 
-        # Construct TensorFlow graph
-        distance_expr = []
-        for gpu_idx in range(num_gpus):
-            with tf.device("/gpu:%d" % gpu_idx):
-                Gs_clone = Gs.clone()
-                noise_vars = [var for name, var in Gs_clone.components.synthesis.vars.items() if name.startswith("noise")]
+        # Interpolate in W or Z
+        if self.space == "w":
+            w0, w1 = self.G.mapping(z = torch.cat([z0, z1]), c = torch.cat([c,c])).chunk(2)
+            wt0 = w0.lerp(w1, t.unsqueeze(1).unsqueeze(2))
+            wt1 = w0.lerp(w1, t.unsqueeze(1).unsqueeze(2) + self.epsilon)
+        else: # space == "z"
+            zt0 = slerp(z0, z1, t.unsqueeze(1))
+            zt1 = slerp(z0, z1, t.unsqueeze(1) + self.epsilon)
+            wt0, wt1 = self.G.mapping(z = torch.cat([zt0,zt1]), c = torch.cat([c,c])).chunk(2)
 
-                # Generate random latents and interpolation t-values
-                lat_t01 = tf.random_normal([self.batch_per_gpu * 2] + Gs_clone.input_shape[1:])
-                lerp_t = tf.random_uniform([self.batch_per_gpu], 0.0, 1.0 if self.sampling == "full" else 0.0)
-                labels = tf.reshape(tf.tile(self._get_random_labels_tf(self.batch_per_gpu), [1, 2]), [self.batch_per_gpu * 2, -1])
+        # Randomize noise buffers
+        for name, buf in self.G.named_buffers():
+            if name.endswith(".noise_const"):
+                buf.copy_(torch.randn_like(buf))
 
-                # Interpolate in W or Z
-                if self.space == "w":
-                    dlat_t01 = Gs_clone.get_output_for(latents, labels, **Gs_kwargs, return_dlatents = True)[-1]
-                    dlat_t01 = tf.cast(dlat_t01, tf.float32)
-                    dlat_t0, dlat_t1 = dlat_t01[0::2], dlat_t01[1::2]
-                    dlat_e0 = tflib.lerp(dlat_t0, dlat_t1, lerp_t[:, np.newaxis, np.newaxis])
-                    dlat_e1 = tflib.lerp(dlat_t0, dlat_t1, lerp_t[:, np.newaxis, np.newaxis] + self.epsilon)
-                    dlat_e01 = tf.reshape(tf.stack([dlat_e0, dlat_e1], axis = 1), dlat_t01.shape)
-                else:
-                    lat_t0, lat_t1 = lat_t01[0::2], lat_t01[1::2]
-                    lat_e0 = slerp(lat_t0, lat_t1, lerp_t[:, np.newaxis])
-                    lat_e1 = slerp(lat_t0, lat_t1, lerp_t[:, np.newaxis] + self.epsilon)
-                    lat_e01 = tf.reshape(tf.stack([lat_e0, lat_e1], axis = 1), lat_t01.shape)
-                    dlat_e01 = Gs_clone.get_output_for(latents, labels, **Gs_kwargs, return_dlatents = True)[-1]
+        # Generate images
+        img = self.G.synthesis(ws = torch.cat([wt0,wt1]), noise_mode = "const", force_fp32 = True, **self.G_kwargs)
 
-                # Synthesize images
-                with tf.control_dependencies([var.initializer for var in noise_vars]): # use same noise inputs for the entire batch
-                    imgs = Gs_clone.get_output_for(dlat_e01, labels, noise_mode = "const", **Gs_kwargs, take_dlatents = True)[0]
-                    imgs = tf.cast(imgs, tf.float32)
+        # Center crop
+        if self.crop:
+            assert img.shape[2] == img.shape[3]
+            c = img.shape[2] // 8
+            img = img[:, :, c*3 : c*7, c*2 : c*6]
 
-                # Crop only the face region
-                if self.crop:
-                    c = int(imgs.shape[2] // 8)
-                    imgs = imgs[:, :, c*3 : c*7, c*2 : c*6]
+        # Downsample to 256x256
+        factor = self.G.img_resolution // 256
+        if factor > 1:
+            img = img.reshape([-1, img.shape[1], img.shape[2] // factor, factor, img.shape[3] // factor, factor]).mean([3, 5])
 
-                # Downsample image to 256x256 if it"s larger than that. VGG was built for 224x224 images
-                factor = imgs.shape[2] // 256
-                if factor > 1:
-                    imgs = tf.reshape(imgs, [-1, imgs.shape[1], imgs.shape[2] // factor, factor, imgs.shape[3] // factor, factor])
-                    imgs = tf.reduce_mean(imgs, axis=[3,5])
+        # Scale dynamic range from [-1,1] to [0,255]
+        img = (img + 1) * (255 / 2)
+        if self.G.img_channels == 1:
+            img = img.repeat([1, 3, 1, 1])
 
-                # Scale dynamic range from [-1,1] to [0,255] for VGG
-                imgs = (imgs + 1) * (255 / 2)
+        # Evaluate differential LPIPS
+        lpips_t0, lpips_t1 = self.vgg16(img, resize_images = False, return_lpips = True).chunk(2)
+        dist = (lpips_t0 - lpips_t1).square().sum(1) / self.epsilon ** 2
+        return dist
 
-                # Evaluate perceptual distance
-                img_e0, img_e1 = imgs[0::2], imgs[1::2]
-                distance_measure = misc.load_pkl("http://d36zk2xti64re0.cloudfront.net/stylegan1/networks/metrics/vgg16_zhang_perceptual.pkl")
-                distance_expr.append(distance_measure.get_output_for(img_e0, img_e1) * (1 / self.epsilon**2))
+#----------------------------------------------------------------------------
 
-        # Sampling loop
-        all_distances = []
-        for begin in range(0, self.num_samples, batch_size):
-            self._report_progress(begin, self.num_samples)
-            all_distances += tflib.run(distance_expr)
-        all_distances = np.concatenate(all_distances, axis = 0)
+def compute_ppl(opts, epsilon, space, sampling, crop, batch_size, jit = False):
+    dataset = dnnlib.util.construct_class_by_name(**opts.dataset_kwargs)
+    vgg16_url = "https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada-pytorch/pretrained/metrics/vgg16.pt"
+    vgg16 = metric_utils.get_feature_detector(vgg16_url, num_gpus = opts.num_gpus, rank = opts.rank, verbose = opts.progress.verbose)
 
-        # Reject outliers
-        lo = np.percentile(all_distances, 1, interpolation = "lower")
-        hi = np.percentile(all_distances, 99, interpolation = "higher")
-        filtered_distances = np.extract(np.logical_and(lo <= all_distances, all_distances <= hi), all_distances)
-        self._report_result(np.mean(filtered_distances))
+    # Setup sampler
+    sampler = PPLSampler(G = opts.G, G_kwargs = opts.G_kwargs, epsilon = epsilon, space = space, sampling = sampling, crop = crop, vgg16 = vgg16)
+    sampler.eval().requires_grad_(False).to(opts.device)
+    if jit:
+        c = torch.zeros([batch_size, *opts.G.cond_shape[1:]], device = opts.device)
+        sampler = torch.jit.trace(sampler, [c], check_trace = False)
+
+    # Sampling loop
+    dist = []
+    progress = opts.progress.sub(tag="ppl sampling", num_items = opts.max_items)
+    for batch_start in range(0, opts.max_items, batch_size * opts.num_gpus):
+        progress.update(batch_start)
+        c = [dataset.get_label(np.random.randint(len(dataset))) for _i in range(batch_size)]
+        c = torch.from_numpy(np.stack(c)).pin_memory().to(opts.device)
+        x = sampler(c)
+        for src in range(opts.num_gpus):
+            y = x.clone()
+            if opts.num_gpus > 1:
+                torch.distributed.broadcast(y, src = src)
+            dist.append(y)
+    progress.update(opts.max_items)
+
+    # Compute PPL
+    if opts.rank != 0:
+        return float("nan")
+    dist = torch.cat(dist)[:opts.max_items].cpu().numpy()
+    lo = np.percentile(dist, 1, interpolation="lower")
+    hi = np.percentile(dist, 99, interpolation="higher")
+    ppl = np.extract(np.logical_and(dist >= lo, dist <= hi), dist).mean()
+    return float(ppl)

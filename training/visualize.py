@@ -2,10 +2,10 @@ import shutil
 import numpy as np
 import PIL.Image
 
-import dnnlib
-import dnnlib.tflib as tflib
 from tqdm import tqdm, trange
 from training import misc
+import os
+import torch
 
 # Compute the effective batch size given a total number of elements, the batch index, and the
 # batch size. For the last batch, its effective size might be smaller if the total_num is not
@@ -15,26 +15,34 @@ def curr_section_size(total_num, idx, batch_size):
     end = min((idx + 1) * batch_size, total_num)
     return end - start
 
+def run(G, zs, cs, batch_size, truncation_psi, **kwargs):
+    if cs.shape[0] == 1:
+        cs = cs.repeat(zs.shape[0], 1)
+    outs = [G(z, c, truncation_psi = truncation_psi, **kwargs) for z, c in zip(zs.split(batch_size), cs.split(batch_size))]
+    outs = zip(*outs)
+    outs = [torch.cat([batch.cpu() for batch in out]).numpy() for out in outs]
+    return outs
+
 # Mathematical utilities
 # ----------------------------------------------------------------------------
 
 # Linear interpolation
 def lerp(a, b, ts):
-    ts = ts[:, np.newaxis]
+    ts = ts[:, None]
     return a + (b - a) * ts
 
 def normalize(v):
-    return v / np.linalg.norm(v, axis = -1, keepdims = True)
+    return v / v.norm(dim = -1, keepdim = True)
 
 # Spherical interpolation
 def slerp(a, b, ts):
-    ts = ts[:, np.newaxis]
+    ts = ts[:, None]
     a = normalize(a)
     b = normalize(b)
-    d = np.sum(a * b, axis = -1, keepdims = True)
-    p = ts * np.arccos(d)
+    d = (a * b).sum(dim = -1, keepdim = True)
+    p = ts * torch.acos(d)
     c = normalize(b - d * a)
-    d = a * np.cos(p) + c * np.sin(p)
+    d = a * torch.cos(p) + c * torch.sin(p)
     return normalize(d)
 
 # Evaluate: generate variety of samples
@@ -50,13 +58,16 @@ def slerp(a, b, ts):
 # style_mix      : Create style mixing visualization
 def vis(G,
     dataset,                          # The dataset object for accessing the data
+    device,                           # Device to run visualization on
     batch_size,                       # Visualization batch size
+    run_dir             = ".",        # Output directory
     training            = False,      # Training mode
     latents             = None,       # Source latents to generate images from
     labels              = None,       # Source labels to generate images from (0 if no labels are used)
     ratio               = 1.0,        # Image height/width ratio in the dataset
+    truncation_psi      = 0.7,        # Style strength multiplier for the truncation trick (used for visualizations only)
     # Model settings
-    components_num      = 1,          # Number of components the model has
+    k                   = 1,          # Number of components the model has
     drange_net          = [-1,1],     # Model image output range
     attention           = False,      # Whereas the model produces attention maps (for visualization)
     num_heads           = 1,          # Number of attention heads
@@ -80,42 +91,36 @@ def vis(G,
     section_size        = 100):       # Visualization section size (section_size <= num) for reducing memory footprint
     
     def prefix(step): return "" if step is None else f"{step:06d}_"
-    def pattern_of(dir, step, suffix): return f"visuals/{dir}/{prefix(step)}%06d.{suffix}"
-
-    # For time efficiency, during training save only image and map samples
-    # rather than richer visualizations
-    vis = vis_types
-    if training:
-        vis = {"imgs"} #, "maps"
-    #    if num_heads == 1:
-    #        vis.add("layer_maps")
-        section_size = num = len(latents)
-    else:
-        if vis is None:
-            vis = {"imgs", "maps", "ltnts", "interpolations", "noise_var"}
+    def pattern_of(dir, step, suffix): return f"{run_dir}/visuals/{dir}/{prefix(step)}%06d.{suffix}"
 
     # Set default options
-    # Save image samples in one grid file during training    
-    if grid is None:
-        grid = training
-    # Disable verbose during training
-    if verbose is None:
-        verbose = not training
-    # If grid size is provided, set number of visualized images accordingly
-    if grid_size is not None:
-        rich_num = num = np.prod(grid_size)
+    if verbose is None: verbose = not training # Disable verbose during training
+    if grid is None: grid = training # Save image samples in one grid file during training    
+    if grid_size is not None: section_size = rich_num = num = np.prod(grid_size) # If grid size is provided, set images number accordingly
 
+    _labels, _latents = labels, latents
+    if _latents is not None: assert num == _latents.shape[0]
+    if _labels  is not None: assert num == _labels.shape[0]
     assert rich_num <= section_size
 
-    # Build image functions
+    vis = vis_types
+    # For time efficiency, during training save only image and map samples rather than richer visualizations
+    if training:
+        vis = {"imgs"} # , "maps"
+        # if num_heads == 1:
+        #    vis.add("layer_maps")
+    else:
+        vis = vis or {"imgs", "maps", "ltnts", "interpolations", "noise_var"}
+
+    # Build utility functions
     save_images = misc.save_images_builder(drange_net, ratio, grid_size, grid, verbose)
     save_blends = misc.save_blends_builder(drange_net, ratio, grid_size, grid, verbose, alpha)
-    crange = trange if verbose else range
 
-    # Set up noise
-    noise_vars = [var for name, var in G.components.synthesis.vars.items() if name.startswith("noise")]
-    noise_var_vals = {var: np.random.randn(*var.shape.as_list()) for var in noise_vars}
-    tflib.set_vars(noise_var_vals)
+    crange = trange if verbose else range
+    section_of = lambda a, i, n: a[i * n: (i + 1) * n]
+
+    get_rnd_latents = lambda n: torch.randn([n, *G.input_shape[1:]], device = device)
+    get_rnd_labels = lambda n: torch.from_numpy(dataset.get_random_labels(n)).to(device)
 
     # Create directories
     dirs = []
@@ -126,60 +131,48 @@ def vis(G,
     if "interpolations" in vis:  dirs += ["interpolations-z", "interpolation-w"]
 
     if not keep_samples:
-        shutil.rmtree(dnnlib.make_run_dir_path("visuals"))
+        shutil.rmtree(f"{run_dir}/visuals")
     for dir in dirs:
-        misc.mkdir(dnnlib.make_run_dir_path(f"visuals/{dir}"))        
+        os.makedirs(f"{run_dir}/visuals/{dir}", exist_ok = True)
 
+    if verbose:
+        print("Running network and saving samples...")
+    
     # Produce visualizations
     for idx in crange(0, num, section_size):
         curr_size = curr_section_size(num, idx, section_size)
-        if verbose and num > curr_size:
-            print(f"--- Batch {idx + 1}/{num}")
 
-        # Compute source latents images will be produced from
-        if latents is None:
-            latents = np.random.randn(curr_size, *G.input_shape[1:])
-        if labels is None:
-            labels = dataset.get_batch_np(curr_size)[1]
-
+        # Compute source latents/labels that images will be produced from
+        latents = get_rnd_latents(curr_size) if _latents is None else section_of(_latents, idx, section_size)
+        labels  = get_rnd_labels(curr_size)  if _labels  is None else section_of(_labels,  idx, section_size)
         if idx == 0:
             latents0, labels0 = latents, labels
-
         # Run network over latents and produce images and attention maps
-        if verbose:
-            print("Running network...")
-
-        ret = G.run(latents, labels, noise_mode = "const", batch_size = batch_size, return_ws = True) # is_visualization = True
+        ret = run(G, latents, labels, batch_size, truncation_psi, noise_mode = "const", 
+            return_att = True, return_ws = True)
         # For memory efficiency, save full information only for a small amount of images
         images, attmaps_all_layers, wlatents_all_layers = ret
         soft_maps = attmaps_all_layers[:,:,-1,0] if attention else None
         attmaps_all_layers = attmaps_all_layers[:rich_num]
         wlatents = wlatents_all_layers[:,:,0]
-
         # Save image samples
         if "imgs" in vis:
-            if verbose:
-                print("Saving image samples...")
             save_images(images, pattern_of("images", step, "png"), idx)
 
         # Save latent vectors
         if "ltnts" in vis:
-            if verbose:
-                print("Saving latents...")
             misc.save_npys(latents, pattern_of("latents-z", step, "npy"), verbose, idx)
             misc.save_npys(wlatents, pattern_of("latents-w", step, "npy"), verbose, idx)
 
         # For the GANformer model, save attention maps
         if attention:
             if "maps" in vis:
-                pallete = np.expand_dims(misc.get_colors(components_num), axis = [2, 3])
+                pallete = np.expand_dims(misc.get_colors(k - 1), axis = [2, 3])
                 maps = (soft_maps == np.amax(soft_maps, axis = 1, keepdims = True)).astype(float)
 
                 soft_maps = np.sum(pallete * np.expand_dims(soft_maps, axis = 2), axis = 1)
                 maps = np.sum(pallete * np.expand_dims(maps, axis = 2), axis = 1)
 
-                if verbose:
-                    print("Saving maps...")
                 save_images(soft_maps, pattern_of("softmaps", step, "png"), idx)
                 save_images(maps, pattern_of("maps", step, "png"), idx)
 
@@ -198,69 +191,66 @@ def vis(G,
                         hmap = np.sum(pallete * hmap, axis = 1)
                         all_maps.append((hmap, f"l{layer}_h{head}"))
 
-                if verbose:
-                    print("Saving layer maps...")
-                    all_maps = tqdm(all_maps)
                 if not grid:
                     for i in range(rich_num):
                         stepdir = "" if step is None else (f"/{step:06d}")
-                        misc.mkdir(dnnlib.make_run_dir_path("visuals/layer_maps/%06d" % i + stepdir))
+                        os.makedirs(f"{run_dir}/visuals/layer_maps/%06d" % i + stepdir, exist_ok = True)
                 for maps, name in all_maps:
                     if grid:
-                        pattern = f"visuals/layer_maps/{prefix(step)}%06d_{name}.png"
+                        pattern = f"{run_dir}/visuals/layer_maps/{prefix(step)}%06d-{name}.png"
                     else:
-                        pattern = f"visuals/layer_maps/%06d/{stepdir}/{name}.png"                       
+                        pattern = f"{run_dir}/visuals/layer_maps/%06d/{stepdir}/{name}.png"
                     save_images(maps, pattern, idx)
 
     # Produce interpolations between pairs or source latents
     # In the GANformer case, varying one component at a time
     if "interpolations" in vis:
-        ts = np.linspace(0.0, 1.0, num = intrp_density, endpoint = True)
+        ts = torch.linspace(0.0, 1.0, steps = intrp_density)
 
         if verbose:
             print("Generating interpolations...")
         for i in crange(rich_num):
-            misc.mkdir(dnnlib.make_run_dir_path("visuals/interpolations-z/%06d" % i))
-            misc.mkdir(dnnlib.make_run_dir_path("visuals/interpolations-w/%06d" % i))
+            os.makedirs(f"{run_dir}/visuals/interpolations-z/%06d" % i, exist_ok = True)
+            os.makedirs(f"{run_dir}/visuals/interpolations-w/%06d" % i, exist_ok = True)
 
-            z = np.random.randn(2, *G.input_shape[1:])
+            z = get_rnd_latents(2)
             z[0] = latents0[i]
             c = labels0[i:i+1]
-
-            w = G.run(z, c, noise_mode = "const", return_ws = True, batch_size = batch_size)[-1]
+            
+            w = run(G, z, c, batch_size, truncation_psi, noise_mode = "const", return_ws = True)[-1]
 
             def update(t, fn, ts, dim):
                 if dim == 3:
-                    ts = ts[:, np.newaxis]
+                    ts = ts[:, None]
                 t_ups = []
 
                 if intrp_per_component:
-                    for c in range(components_num):
+                    for c in range(k - 1):
                         # copy over all the components except component c that will get interpolated
-                        t_up = np.tile(np.copy(t[0])[None], [intrp_density] + [1] * dim)
+                        t_up = torch.clone(t[0]).unsqueeze(0).repeat((intrp_density, ) + tuple([1] * dim))
                         # interpolate component c
                         t_up[:,c] = fn(t[0, c], t[1, c], ts)
                         t_ups.append(t_up)
 
-                    t_up = np.concatenate(t_ups, axis = 0)
+                    t_up = torch.cat(t_ups, dim = 0)
                 else:
-                    t_up = fn(t[0], t[1], ts[:, np.newaxis])
+                    t_up = fn(t[0], t[1], ts.unsqueeze(1))
 
                 return t_up
 
             z_up = update(z, slerp, ts, 2)
             w_up = update(w, lerp, ts, 3)
 
-            imgs1 = G.run(z_up, labels, noise_mode = "const", batch_size = batch_size)[0]
-            imgs2 = G.run(w_up, labels, noise_mode = "const", batch_size = batch_size, take_ws = True)[0]
+            imgs1 = run(G, z_up, c, batch_size, truncation_psi, noise_mode = "const")[0]
+            imgs2 = run(G, w_up, c, batch_size, truncation_psi, noise_mode = "const", take_w = True)[0]
 
             def save_interpolation(imgs, name):
-                imgs = np.split(imgs, components_num, axis = 0)
-                for c in range(components_num):
-                    filename = "visuals/interpolations-%s/%06d/%02d" % (name, i, c)
+                imgs = np.split(imgs, k - 1, axis = 0)
+                for c in range(k - 1):
+                    filename = f"{run_dir}/visuals/interpolations-{name}/{i:06d}/{c:02d}"
                     imgs[c] = [misc.to_pil(img, drange = drange_net) for img in imgs[c]]
-                    imgs[c][-1].save(dnnlib.make_run_dir_path(f"{filename}.png"))
-                    misc.save_gif(imgs[c], dnnlib.make_run_dir_path(f"{filename}.gif"))
+                    imgs[c][-1].save(f"{filename}.png")
+                    misc.save_gif(imgs[c], f"{filename}.gif")
 
             save_interpolation(imgs1, "z")
             save_interpolation(imgs2, "w")
@@ -271,12 +261,14 @@ def vis(G,
     if "noise_var" in vis:
         if verbose:
             print("Generating noise variance...")
-        z = np.tile(np.random.randn(1, *G.input_shape[1:]), [noise_samples_num, 1, 1])
-        imgs = G.run(z, labels, batch_size = batch_size)[0]
+
+        z = get_rnd_latents(1).repeat(noise_samples_num, 1, 1)
+        c = get_rnd_labels(1)
+        imgs = run(G, z, c, batch_size, truncation_psi)[0]
         imgs = np.stack([misc.to_pil(img, drange = drange_net) for img in imgs], axis = 0)
         diff = np.std(np.mean(imgs, axis = 3), axis = 0) * 4
         diff = np.clip(diff + 0.5, 0, 255).astype(np.uint8)
-        PIL.Image.fromarray(diff, "L").save(dnnlib.make_run_dir_path("visuals/noise-variance.png"))
+        PIL.Image.fromarray(diff, "L").save(f"{run_dir}/visuals/noise-variance.png")
 
     # Compute style mixing table, varying using the latent A in some of the layers and latent B in rest.
     # For the GANformer, also produce component mixes (using latents from A in some of the components,
@@ -286,6 +278,7 @@ def vis(G,
             print("Generating style mixes...")
         cols, rows = 4, 2
         row_lens = np.array([2, 5, 8, 11])
+        c = get_rnd_labels(1)
 
         # Create latent mixes
         mixes = {
@@ -294,14 +287,14 @@ def vis(G,
         }
         ws = wlatents_all_layers[:cols+rows]
         orig_imgs = images[:cols+rows]
-        col_ltnts = wlatents_all_layers[:cols][None, None]
-        row_ltnts = wlatents_all_layers[cols:cols+rows][None,:,None]
+        col_z = wlatents_all_layers[:cols][None, None]
+        row_z = wlatents_all_layers[cols:cols+rows][None,:,None]
 
         for name, mix in mixes.items():
             # Produce image mixes
-            mix_ltnts = mix * row_ltnts  + (1 - mix) * col_ltnts
-            mix_ltnts = np.reshape(mix_ltnts, [-1, *wlatents_all_layers.shape[1:]])
-            mix_imgs = G.run(mix_ltnts, labels, noise_mode = "const", take_ws = True, batch_size = batch_size)[0]
+            mix_z = mix * row_z  + (1 - mix) * col_z
+            mix_z = torch.from_numpy(np.reshape(mix_z, [-1, *wlatents_all_layers.shape[1:]])).to(device)
+            mix_imgs = run(G, mix_z, c, batch_size, truncation_psi, noise_mode = "const", take_w = True)[0]
             mix_imgs = np.reshape(mix_imgs, [len(row_lens) * rows, cols, *mix_imgs.shape[1:]])
 
             # Create image table canvas
@@ -318,7 +311,7 @@ def vis(G,
 
                     canvas.paste(misc.to_pil(img, drange = drange_net), (W * col_idx, H * row_idx))
 
-            canvas.save(dnnlib.make_run_dir_path(f"visuals/{name}-mixing.png"))
+            canvas.save(f"{run_dir}/visuals/{name}-mixing.png")
 
     if verbose:
         misc.log("Visualizations Completed!", "blue")

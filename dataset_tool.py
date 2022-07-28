@@ -1,6 +1,4 @@
-# Tool for creating TFRecords datasets.
-# It supports multi-resolution (saving the images in different resolutions) but isn't
-# essential for the model as it needs only one resolution for training.
+# Tool for creating image datasets.
 import os
 import sys
 import glob
@@ -15,44 +13,34 @@ import cv2
 import io
 from tqdm import tqdm, trange
 from training import misc 
+import re
 
 def error(msg):
     print("Error: " + msg)
     exit(1)
 
-class TFRecordExporter:
-    def __init__(self, tfrecord_dir, expected_imgs, verbose = False, progress_interval = 10, shards_num = 5):
-        self.tfrecord_dir       = tfrecord_dir
-        self.tfr_prefix         = os.path.join(self.tfrecord_dir, os.path.basename(self.tfrecord_dir))
+class DatasetExporter:
+    def __init__(self, dataset_dir, expected_imgs, verbose = False, progress_interval = 10):
+        self.dataset_dir        = dataset_dir
         self.expected_imgs      = expected_imgs
         self.curr_imgnum        = 0
         self.shape              = None
         self.resolution_log2    = None
-        self.tfr_writers        = []
         self.verbose            = verbose
         self.progress_interval  = progress_interval
         self.writer_index       = 0
         self.initialized        = False
-        self.shards_num         = shards_num
 
         if self.verbose:
-            print("Creating dataset %s" % tfrecord_dir)
-        os.makedirs(self.tfrecord_dir, exist_ok = True)
+            print("Creating dataset %s" % dataset_dir)
+        os.makedirs(self.dataset_dir, exist_ok = True)
+        assert os.path.isdir(self.dataset_dir)
 
     def close(self):
         if self.verbose:
-            print("%-40s\r" % "Flushing data...", end = "", flush = True)
-
-        for tfr_writers in self.tfr_writers:
-            for tfr_writer in tfr_writers:
-                tfr_writer.close()
-        self.tfr_writers = []
-
-        if self.verbose:
-            print("%-40s\r" % "", end = "", flush = True)
             print("Added %d images." % self.curr_imgnum)
 
-    def choose_shuffled_order(self): # Note: Images and labels must be added in shuffled order.
+    def choose_shuffled_order(self): # Note: Images and labels must be added in shuffled order
         order = np.arange(self.expected_imgs)
         np.random.RandomState(123).shuffle(order)
         return order
@@ -67,42 +55,28 @@ class TFRecordExporter:
             assert self.shape[0] in [1, 2, 3]
             assert self.shape[1] == self.shape[2]
             assert self.shape[1] == 2**self.resolution_log2
-
-            for lod in range(self.resolution_log2 - 1):
-                tfr_writers_lod = []
-                for shard in range(self.shards_num):
-                    tfr_opt = tf.io.TFRecordOptions("")
-                    tfr_file = self.tfr_prefix + "-r%02d.tfrecords%dof%d" % (self.resolution_log2 - lod, 
-                        shard + 1, self.shards_num)
-                    tfr_writers_lod.append(tf.io.TFRecordWriter(tfr_file, tfr_opt))
-                self.tfr_writers.append(tfr_writers_lod)
-
             self.initialized = True
 
         assert img.shape == self.shape
 
-        for lod, tfr_writers in enumerate(self.tfr_writers):
+        for lod in range(self.resolution_log2 - 1):
+            resolution = 2 ** (self.resolution_log2 - lod)
+            os.makedirs(f"{self.dataset_dir}/{resolution}", exist_ok = True)
             if lod:
                 img = img.astype(np.float32)
                 img = (img[:, 0::2, 0::2] + img[:, 0::2, 1::2] + img[:, 1::2, 0::2] + img[:, 1::2, 1::2]) * 0.25
+            out_img = np.rint(img).clip(0, 255).astype(np.uint8)
+            out_img = PIL.Image.fromarray(out_img.transpose(1, 2, 0))
+            img_name = f"{self.dataset_dir}/{resolution}/{self.curr_imgnum}.png"
+            out_img.save(img_name, format = "png")
 
-            quant = np.rint(img).clip(0, 255).astype(np.uint8)
-            features = {
-                "shape": tf.train.Feature(int64_list = tf.train.Int64List(value = quant.shape)),
-                "data": tf.train.Feature(bytes_list = tf.train.BytesList(value=[quant.tostring()]))
-            }
-            ex = tf.train.Example(features = tf.train.Features(feature = features))
-
-            tfr_writers[self.writer_index].write(ex.SerializeToString())
-
-        self.writer_index = (self.writer_index + 1) % self.shards_num
         self.curr_imgnum += 1
 
     def add_labels(self, labels):
         if self.verbose:
             print("%-40s\r" % "Saving labels...", end = "", flush = True)
         assert labels.shape[0] == self.curr_imgnum
-        with open(self.tfr_prefix + "-rxx.labels", "wb") as f:
+        with open(f"{self.dataset_dir}/labels.npy", "wb") as f:
             np.save(f, labels.astype(np.float32))
 
     def __enter__(self):
@@ -144,7 +118,7 @@ class ThreadPool(object):
             thread.daemon = True
             thread.start()
 
-    def add_task(self, func, args=()):
+    def add_task(self, func, args = ()):
         assert hasattr(func, "__call__") # must be a function
         if func not in self.result_queues:
             self.result_queues[func] = Queue.Queue()
@@ -188,7 +162,7 @@ class ThreadPool(object):
         for idx, item in enumerate(item_iterator):
             prepared = pre_func(item)
             results.append(None)
-            self.add_task(func = task_func, args=(prepared, idx))
+            self.add_task(func = task_func, args = (prepared, idx))
             while retire_idx[0] < idx - max_items_in_flight + 2:
                 for res in retire_result(): yield res
         while retire_idx[0] < len(results):
@@ -196,16 +170,16 @@ class ThreadPool(object):
 
 # ----------------------------------------------------------------------------
 
-def display(tfrecord_dir):
-    print("Loading dataset %s" % tfrecord_dir)
+def display(dataset_dir):
+    print("Loading dataset %s" % dataset_dir)
     tflib.init_tf({"gpu_options.allow_growth": True})
-    dset = dataset.TFRecordDataset(tfrecord_dir, max_label_size = "full", repeat = False, shuffle_mb = 0)
+    dset = dataset.TFRecordDataset(dataset_dir, max_label_size = "full", repeat = False, shuffle_mb = 0)
     tflib.init_uninitialized_vars()
 
     idx = 0
     while True:
         try:
-            imgs, labels = dset.get_batch_np(1)
+            imgs, labels = dset.get_minibatch_np(1)
         except tf.errors.OutOfRangeError:
             break
         if idx == 0:
@@ -220,10 +194,10 @@ def display(tfrecord_dir):
             break
     print("\nDisplayed %d images." % idx)
 
-def extract(tfrecord_dir, output_dir):
-    print("Loading dataset %s" % tfrecord_dir)
+def extract(dataset_dir, output_dir):
+    print("Loading dataset %s" % dataset_dir)
     tflib.init_tf({"gpu_options.allow_growth": True})
-    dset = dataset.TFRecordDataset(tfrecord_dir, max_label_size = 0, repeat = False, shuffle_mb = 0)
+    dset = dataset.TFRecordDataset(dataset_dir, max_label_size = 0, repeat = False, shuffle_mb = 0)
     tflib.init_uninitialized_vars()
 
     print("Extracting images to %s" % output_dir)
@@ -233,7 +207,7 @@ def extract(tfrecord_dir, output_dir):
         if idx % 10 == 0:
             print("%d\r" % idx, end = "", flush = True)
         try:
-            imgs, _labels = dset.get_batch_np(1)
+            imgs, _labels = dset.get_minibatch_np(1)
         except tf.errors.OutOfRangeError:
             break
         if imgs.shape[1] == 1:
@@ -244,13 +218,13 @@ def extract(tfrecord_dir, output_dir):
         idx += 1
     print("Extracted %d images." % idx)
 
-def compare(tfrecord_dir_a, tfrecord_dir_b, ignore_labels):
+def compare(dataset_dir_a, dataset_dir_b, ignore_labels):
     max_label_size = 0 if ignore_labels else "full"
-    print("Loading dataset %s" % tfrecord_dir_a)
+    print("Loading dataset %s" % dataset_dir_a)
     tflib.init_tf({"gpu_options.allow_growth": True})
-    dset_a = dataset.TFRecordDataset(tfrecord_dir_a, max_label_size = max_label_size, repeat = False, shuffle_mb = 0)
-    print("Loading dataset %s" % tfrecord_dir_b)
-    dset_b = dataset.TFRecordDataset(tfrecord_dir_b, max_label_size = max_label_size, repeat = False, shuffle_mb = 0)
+    dset_a = dataset.TFRecordDataset(dataset_dir_a, max_label_size = max_label_size, repeat = False, shuffle_mb = 0)
+    print("Loading dataset %s" % dataset_dir_b)
+    dset_b = dataset.TFRecordDataset(dataset_dir_b, max_label_size = max_label_size, repeat = False, shuffle_mb = 0)
     tflib.init_uninitialized_vars()
 
     print("Comparing datasets")
@@ -261,11 +235,11 @@ def compare(tfrecord_dir_a, tfrecord_dir_b, ignore_labels):
         if idx % 100 == 0:
             print("%d\r" % idx, end = "", flush = True)
         try:
-            imgs_a, labels_a = dset_a.get_batch_np(1)
+            imgs_a, labels_a = dset_a.get_minibatch_np(1)
         except tf.errors.OutOfRangeError:
             imgs_a, labels_a = None, None
         try:
-            imgs_b, labels_b = dset_b.get_batch_np(1)
+            imgs_b, labels_b = dset_b.get_minibatch_np(1)
         except tf.errors.OutOfRangeError:
             imgs_b, labels_b = None, None
         if imgs_a is None or imgs_b is None:
@@ -287,7 +261,7 @@ def compare(tfrecord_dir_a, tfrecord_dir_b, ignore_labels):
 
 # ----------------------------------------------------------------------------
 
-def create_mnist(tfrecord_dir, mnist_dir):
+def create_mnist(dataset_dir, mnist_dir):
     print("Loading MNIST from %s" % mnist_dir)
     import gzip
     with gzip.open(os.path.join(mnist_dir, "train-images-idx3-ubyte.gz"), "rb") as file:
@@ -303,13 +277,13 @@ def create_mnist(tfrecord_dir, mnist_dir):
     onehot = np.zeros((labels.size, np.max(labels) + 1), dtype = np.float32)
     onehot[np.arange(labels.size), labels] = 1.0
 
-    with TFRecordExporter(tfrecord_dir, imgs.shape[0]) as tfr:
+    with DatasetExporter(dataset_dir, imgs.shape[0]) as tfr:
         order = tfr.choose_shuffled_order()
         for idx in range(order.size):
             tfr.add_img(imgs[order[idx]])
         tfr.add_labels(onehot[order])
 
-def create_mnistrgb(tfrecord_dir, mnist_dir, num_imgs = 1000000, random_seed = 123):
+def create_mnistrgb(dataset_dir, mnist_dir, num_imgs = 1000000, random_seed = 123):
     print("Loading MNIST from %s" % mnist_dir)
     import gzip
     with gzip.open(os.path.join(mnist_dir, "train-images-idx3-ubyte.gz"), "rb") as file:
@@ -319,14 +293,14 @@ def create_mnistrgb(tfrecord_dir, mnist_dir, num_imgs = 1000000, random_seed = 1
     assert imgs.shape == (60000, 32, 32) and imgs.dtype == np.uint8
     assert np.min(imgs) == 0 and np.max(imgs) == 255
 
-    with TFRecordExporter(tfrecord_dir, num_imgs) as tfr:
+    with DatasetExporter(dataset_dir, num_imgs) as tfr:
         rnd = np.random.RandomState(random_seed)
         for _idx in range(num_imgs):
             tfr.add_img(imgs[rnd.randint(imgs.shape[0], size = 3)])
 
 # ----------------------------------------------------------------------------
 
-def create_cifar10(tfrecord_dir, cifar10_dir):
+def create_cifar10(dataset_dir, cifar10_dir):
     print("Loading CIFAR-10 from %s" % cifar10_dir)
     import pickle
     imgs = []
@@ -345,13 +319,13 @@ def create_cifar10(tfrecord_dir, cifar10_dir):
     onehot = np.zeros((labels.size, np.max(labels) + 1), dtype = np.float32)
     onehot[np.arange(labels.size), labels] = 1.0
 
-    with TFRecordExporter(tfrecord_dir, imgs.shape[0]) as tfr:
+    with DatasetExporter(dataset_dir, imgs.shape[0]) as tfr:
         order = tfr.choose_shuffled_order()
         for idx in range(order.size):
             tfr.add_img(imgs[order[idx]])
         tfr.add_labels(onehot[order])
 
-def create_cifar100(tfrecord_dir, cifar100_dir):
+def create_cifar100(dataset_dir, cifar100_dir):
     print("Loading CIFAR-100 from %s" % cifar100_dir)
     import pickle
     with open(os.path.join(cifar100_dir, "train"), "rb") as file:
@@ -365,7 +339,7 @@ def create_cifar100(tfrecord_dir, cifar100_dir):
     onehot = np.zeros((labels.size, np.max(labels) + 1), dtype = np.float32)
     onehot[np.arange(labels.size), labels] = 1.0
 
-    with TFRecordExporter(tfrecord_dir, imgs.shape[0]) as tfr:
+    with DatasetExporter(dataset_dir, imgs.shape[0]) as tfr:
         order = tfr.choose_shuffled_order()
         for idx in range(order.size):
             tfr.add_img(imgs[order[idx]])
@@ -373,7 +347,7 @@ def create_cifar100(tfrecord_dir, cifar100_dir):
 
 # ----------------------------------------------------------------------------
 
-def create_svhn(tfrecord_dir, svhn_dir):
+def create_svhn(dataset_dir, svhn_dir):
     print("Loading SVHN from %s" % svhn_dir)
     import pickle
     imgs = []
@@ -392,7 +366,7 @@ def create_svhn(tfrecord_dir, svhn_dir):
     onehot = np.zeros((labels.size, np.max(labels) + 1), dtype = np.float32)
     onehot[np.arange(labels.size), labels] = 1.0
 
-    with TFRecordExporter(tfrecord_dir, imgs.shape[0]) as tfr:
+    with DatasetExporter(dataset_dir, imgs.shape[0]) as tfr:
         order = tfr.choose_shuffled_order()
         for idx in range(order.size):
             tfr.add_img(imgs[order[idx]])
@@ -400,7 +374,7 @@ def create_svhn(tfrecord_dir, svhn_dir):
 
 # ----------------------------------------------------------------------------
 
-def create_lsun(tfrecord_dir, lmdb_dir, resolution = 256, max_imgs = None):
+def create_lsun(dataset_dir, lmdb_dir, resolution = 256, max_imgs = None):
     print("Loading LSUN dataset from %s" % lmdb_dir)
     import lmdb # pip install lmdb
     import io
@@ -408,7 +382,7 @@ def create_lsun(tfrecord_dir, lmdb_dir, resolution = 256, max_imgs = None):
         total_imgs = txn.stat()["entries"]
         if max_imgs is None:
             max_imgs = total_imgs
-        with TFRecordExporter(tfrecord_dir, max_imgs) as tfr:
+        with DatasetExporter(dataset_dir, max_imgs) as tfr:
             for _idx, (_key, value) in enumerate(txn.cursor()):
                 try:
                     try:
@@ -431,7 +405,7 @@ def create_lsun(tfrecord_dir, lmdb_dir, resolution = 256, max_imgs = None):
                 if tfr.curr_imgnum == max_imgs:
                     break
 
-def create_lsun_wide(tfrecord_dir, lmdb_dir, width = 512, height = 384, max_imgs = None):
+def create_lsun_wide(dataset_dir, lmdb_dir, width = 512, height = 384, max_imgs = None):
     assert width == 2 ** int(np.round(np.log2(width)))
     assert height <= width
     print("Loading LSUN dataset from %s" % lmdb_dir)
@@ -442,7 +416,7 @@ def create_lsun_wide(tfrecord_dir, lmdb_dir, width = 512, height = 384, max_imgs
         total_imgs = txn.stat()["entries"]
         if max_imgs is None:
             max_imgs = total_imgs
-        with TFRecordExporter(tfrecord_dir, max_imgs, verbose = False) as tfr:
+        with DatasetExporter(dataset_dir, max_imgs, verbose = False) as tfr:
             for idx, (_key, value) in enumerate(txn.cursor()):
                 try:
                     try:
@@ -476,7 +450,7 @@ def create_lsun_wide(tfrecord_dir, lmdb_dir, width = 512, height = 384, max_imgs
 
 # ----------------------------------------------------------------------------
 
-def create_celeba(tfrecord_dir, celeba_dir, cx = 89, cy = 121):
+def create_celeba(dataset_dir, celeba_dir, cx = 89, cy = 121):
     print("Loading CelebA from %s" % celeba_dir)
     glob_pattern = os.path.join(celeba_dir, "img_align_celeba_png", "*.png")
     img_filenames = sorted(glob.glob(glob_pattern))
@@ -484,7 +458,7 @@ def create_celeba(tfrecord_dir, celeba_dir, cx = 89, cy = 121):
     if len(img_filenames) != expected_imgs:
         error("Expected to find %d images" % expected_imgs)
 
-    with TFRecordExporter(tfrecord_dir, len(img_filenames)) as tfr:
+    with DatasetExporter(dataset_dir, len(img_filenames)) as tfr:
         order = tfr.choose_shuffled_order()
         for idx in range(order.size):
             img = np.asarray(PIL.Image.open(img_filenames[order[idx]]))
@@ -493,7 +467,7 @@ def create_celeba(tfrecord_dir, celeba_dir, cx = 89, cy = 121):
             img = img.transpose(2, 0, 1) # HWC => CHW
             tfr.add_img(img)
 
-def create_celebahq(tfrecord_dir, celeba_dir, delta_dir, num_threads = 4, num_tasks = 100):
+def create_celebahq(dataset_dir, celeba_dir, delta_dir, num_threads = 4, num_tasks = 100):
     print("Loading CelebA from '%s'" % celeba_dir)
     expected_imgs = 202599
     if len(glob.glob(os.path.join(celeba_dir, "img_celeba", "*.jpg"))) != expected_imgs:
@@ -597,7 +571,7 @@ def create_celebahq(tfrecord_dir, celeba_dir, delta_dir, num_threads = 4, num_ta
                 np.minimum(np.float32(w-1-x) / pad[2], np.float32(h-1-y) / pad[3]))
             blur = 1024 * 0.02 / zoom
             img += (scipy.ndimage.gaussian_filter(img, [blur, blur, 0]) - img) * np.clip(mask * 3.0 + 1.0, 0.0, 1.0)
-            img += (np.median(img, axis=(0,1)) - img) * np.clip(mask, 0.0, 1.0)
+            img += (np.median(img, axis = (0,1)) - img) * np.clip(mask, 0.0, 1.0)
             img = PIL.Image.fromarray(np.uint8(np.clip(np.round(img), 0, 255)), "RGB")
             quad += pad[0:2]
 
@@ -636,7 +610,7 @@ def create_celebahq(tfrecord_dir, celeba_dir, delta_dir, num_threads = 4, num_ta
         assert md5.hexdigest() == fields["final_md5"][idx]
         return img
 
-    with TFRecordExporter(tfrecord_dir, indices.size) as tfr:
+    with DatasetExporter(dataset_dir, indices.size) as tfr:
         order = tfr.choose_shuffled_order()
         with ThreadPool(num_threads) as pool:
             for img in pool.process_items_concurrently(indices[order].tolist(), process_func = process_func, 
@@ -651,11 +625,11 @@ def create_celebahq(tfrecord_dir, celeba_dir, delta_dir, num_threads = 4, num_ta
 # 3. Resized to the closest power of 2
 # 4. Stored in format C,H,W in the tfrecord file
 # Args:
-# - tfrecord_dir: the output directory
+# - dataset_dir: the output directory
 # - img_dir: the input directory
 # - shuffle: whether to shuffle the dataset before saving
-def create_from_imgs(tfrecord_dir, img_dir, format = "png", shuffle = False, ratio = None, 
-        max_imgs = None, shards_num = 5):
+def create_from_imgs(dataset_dir, img_dir, format = "png", shuffle = False, ratio = None, 
+        max_imgs = None):
     print("Loading images from %s" % img_dir)
     img_filenames = sorted(glob.glob(f"{img_dir}/**/*.{format}", recursive = True))
     if len(img_filenames) == 0:
@@ -674,7 +648,7 @@ def create_from_imgs(tfrecord_dir, img_dir, format = "png", shuffle = False, rat
     # if resolution != 2 ** int(np.floor(np.log2(resolution))):
     #     error("Input image resolution must be a power-of-two")
 
-    with TFRecordExporter(tfrecord_dir, len(img_filenames), shards_num = shards_num) as tfr:
+    with DatasetExporter(dataset_dir, len(img_filenames)) as tfr:
         order = tfr.choose_shuffled_order() if shuffle else np.arange(len(img_filenames))
         for idx in trange(max_imgs):
             img = PIL.Image.open(img_filenames[order[idx]]).convert("RGB")
@@ -692,13 +666,13 @@ def create_from_imgs(tfrecord_dir, img_dir, format = "png", shuffle = False, rat
                 img = img.transpose([2, 0, 1]) # HWC => CHW
             tfr.add_img(img)
 
-def create_from_tfds(tfrecord_dir, dataset_name, ratio = None, max_imgs = None, shards_num = 5):
+def create_from_tfds(dataset_dir, dataset_name, ratio = None, max_imgs = None):
     import tensorflow_datasets as tfds
 
     print("Loading dataset %s" % dataset_name)
-    ds = tfds.load(dataset_name, split = "train", data_dir = f"{tfrecord_dir}/tfds")
-    with TFRecordExporter(tfrecord_dir, 0, shards_num = shards_num) as tfr:
-        for i, ex in tqdm(enumerate(tfds.as_numpy(ds))):
+    ds = tfds.load(dataset_name, split = "train", data_dir = f"{dataset_dir}/tfds")
+    with DatasetExporter(dataset_dir, 0) as tfr:
+        for i, ex in tqdm(enumerate(tfds.as_numpy(ds)), total = max_imgs):
             img = PIL.Image.fromarray(ex["image"])
 
             img = misc.crop_max_rectangle(img, ratio)
@@ -713,7 +687,41 @@ def create_from_tfds(tfrecord_dir, dataset_name, ratio = None, max_imgs = None, 
             if max_imgs is not None and i > max_imgs:
                 break
 
-def create_from_lmdb(tfrecord_dir, lmdb_dir, ratio = None, max_imgs = None, shards_num = 5):
+def create_from_tfrecords(dataset_dir, tfrecords_dir, ratio = None, max_imgs = None):
+    import tensorflow_datasets as tfds
+
+    def parse_tfrecord_tf(record):
+        features = tf.io.parse_single_example(record, features={
+            "shape": tf.io.FixedLenFeature([3], tf.int64),
+            "data": tf.io.FixedLenFeature([], tf.string)})
+        data = tf.io.decode_raw(features["data"], tf.uint8)
+        data = tf.reshape(data, features["shape"])
+        data = tf.transpose(data, [1, 2, 0])
+        return data
+
+    print("Loading dataset %s" % tfrecords_dir)
+    maxres_file = sorted(glob.glob(os.path.join(tfrecords_dir, "*.tfrecords1of*")))[-1]
+    tffiles = sorted(glob.glob(re.sub("1of.*", "*", maxres_file)))
+
+    dataset = tf.data.TFRecordDataset(tffiles)
+    dataset = dataset.map(parse_tfrecord_tf, num_parallel_calls = 4)
+    with DatasetExporter(dataset_dir, 0) as tfr:
+        for i, img in tqdm(enumerate(tfds.as_numpy(dataset)), total = max_imgs):
+            img = PIL.Image.fromarray(img)
+
+            img = misc.crop_max_rectangle(img, ratio)
+            img = misc.pad_min_square(img)
+
+            pow2size = 2 ** int(np.round(np.log2(img.size[0])))
+            img = img.resize((pow2size, pow2size), PIL.Image.ANTIALIAS)
+
+            img = np.asarray(img)
+            img = img.transpose([2, 0, 1]) # HWC => CHW
+            tfr.add_img(img)
+            if max_imgs is not None and i > max_imgs:
+                break
+
+def create_from_lmdb(dataset_dir, lmdb_dir, ratio = None, max_imgs = None):
     import lmdb
     print("Loading dataset %s" % lmdb_dir)
     bad_imgs = 0
@@ -721,7 +729,7 @@ def create_from_lmdb(tfrecord_dir, lmdb_dir, ratio = None, max_imgs = None, shar
         if max_imgs is None:
             max_imgs = txn.stat()["entries"]
 
-        with TFRecordExporter(tfrecord_dir, max_imgs, verbose = False, shards_num = shards_num) as tfr:
+        with DatasetExporter(dataset_dir, max_imgs, verbose = False) as tfr:
             for idx, (_key, value) in tqdm(enumerate(txn.cursor()), total = max_imgs):
                 try:
                     img = PIL.Image.open(io.BytesIO(value))
@@ -744,14 +752,14 @@ def create_from_lmdb(tfrecord_dir, lmdb_dir, ratio = None, max_imgs = None, shar
     if bad_imgs > 0:
         print(f"Couldn't read {bad_imgs} out of {max_imgs} images")
 
-def create_from_npy(tfrecord_dir, npy_filename, shuffle = False, max_imgs = None, shards_num = 5):
+def create_from_npy(dataset_dir, npy_filename, shuffle = False, max_imgs = None):
     print("Loading NPY archive from %s" % npy_filename)
     if max_imgs is None:
         max_imgs = npy_data.shape[0]
 
     with open(npy_filename, "rb") as npy_file:
         npy_data = np.load(npy_file)
-        with TFRecordExporter(tfrecord_dir, npy_data.shape[0], shards_num = shards_num) as tfr:
+        with DatasetExporter(dataset_dir, npy_data.shape[0]) as tfr:
             order = tfr.choose_shuffled_order() if shuffle else np.arange(npy_data.shape[0])
             for idx in trange(max_imgs):
                 tfr.add_img(npy_data[order[idx]])
@@ -759,7 +767,7 @@ def create_from_npy(tfrecord_dir, npy_filename, shuffle = False, max_imgs = None
             if os.path.isfile(npy_filename):
                 tfr.add_labels(np.load(npy_filename)[order])
 
-def create_from_hdf5(tfrecord_dir, hdf5_filename, shuffle = False, max_imgs = None, shards_num = 5):
+def create_from_hdf5(dataset_dir, hdf5_filename, shuffle = False, max_imgs = None):
     import h5py # conda install h5py
     print("Loading HDF5 archive from %s" % hdf5_filename)
     if max_imgs is None:
@@ -768,7 +776,7 @@ def create_from_hdf5(tfrecord_dir, hdf5_filename, shuffle = False, max_imgs = No
     with h5py.File(hdf5_filename, "r") as hdf5_file:
         hdf5_data = max([value for key, value in hdf5_file.items() if key.startswith("data")], 
             key = lambda lod: lod.shape[3])
-        with TFRecordExporter(tfrecord_dir, hdf5_data.shape[0], shards_num = shards_num) as tfr:
+        with DatasetExporter(dataset_dir, hdf5_data.shape[0]) as tfr:
             order = tfr.choose_shuffled_order() if shuffle else np.arange(hdf5_data.shape[0])
             for idx in trange(max_imgs):
                 tfr.add_img(hdf5_data[order[idx]])
@@ -793,56 +801,56 @@ def execute_cmdline(argv):
 
     p = add_command("display",          "Display images in dataset.",
                                         "display datasets/mnist")
-    p.add_argument( "tfrecord_dir",     help = "Directory containing dataset")
+    p.add_argument( "dataset_dir",      help = "Directory containing dataset")
 
     p = add_command("extract",          "Extract images from dataset.",
                                         "extract datasets/mnist mnist-images")
-    p.add_argument( "tfrecord_dir",     help = "Directory containing dataset")
+    p.add_argument( "dataset_dir",      help = "Directory containing dataset")
     p.add_argument( "output_dir",       help = "Directory to extract the images into")
 
     p = add_command("compare",          "Compare two datasets.",
                                         "compare datasets/mydataset datasets/mnist")
-    p.add_argument( "tfrecord_dir_a",   help = "Directory containing first dataset")
-    p.add_argument( "tfrecord_dir_b",   help = "Directory containing second dataset")
+    p.add_argument( "dataset_dir_a",    help = "Directory containing first dataset")
+    p.add_argument( "dataset_dir_b",    help = "Directory containing second dataset")
     p.add_argument( "--ignore_labels",  help = "Ignore labels (default: 0)", type = int, default = 0)
 
     p = add_command("create_mnist",     "Create dataset for MNIST.",
                                         "create_mnist datasets/mnist ~/downloads/mnist")
-    p.add_argument( "tfrecord_dir",     help = "New dataset directory to be created")
+    p.add_argument( "dataset_dir",      help = "New dataset directory to be created")
     p.add_argument( "mnist_dir",        help = "Directory containing MNIST")
 
     p = add_command("create_mnistrgb",  "Create dataset for MNIST-RGB.",
                                         "create_mnistrgb datasets/mnistrgb ~/downloads/mnist")
-    p.add_argument( "tfrecord_dir",     help = "New dataset directory to be created")
+    p.add_argument( "dataset_dir",      help = "New dataset directory to be created")
     p.add_argument( "mnist_dir",        help = "Directory containing MNIST")
     p.add_argument( "--num_imgs",       help = "Number of composite images to create (default: 1000000)", type = int, default = 1000000)
     p.add_argument( "--random_seed",    help = "Random seed (default: 123)", type = int, default = 123)
 
     p = add_command("create_cifar10",   "Create dataset for CIFAR-10.",
                                         "create_cifar10 datasets/cifar10 ~/downloads/cifar10")
-    p.add_argument( "tfrecord_dir",     help = "New dataset directory to be created")
+    p.add_argument( "dataset_dir",      help = "New dataset directory to be created")
     p.add_argument( "cifar10_dir",      help = "Directory containing CIFAR-10")
 
     p = add_command("create_cifar100",  "Create dataset for CIFAR-100.",
                                         "create_cifar100 datasets/cifar100 ~/downloads/cifar100")
-    p.add_argument( "tfrecord_dir",     help = "New dataset directory to be created")
+    p.add_argument( "dataset_dir",      help = "New dataset directory to be created")
     p.add_argument( "cifar100_dir",     help = "Directory containing CIFAR-100")
 
     p = add_command("create_svhn",      "Create dataset for SVHN.",
                                         "create_svhn datasets/svhn ~/downloads/svhn")
-    p.add_argument( "tfrecord_dir",     help = "New dataset directory to be created")
+    p.add_argument( "dataset_dir",      help = "New dataset directory to be created")
     p.add_argument( "svhn_dir",         help = "Directory containing SVHN")
 
     p = add_command("create_lsun",      "Create dataset for single LSUN category.",
                                         "create_lsun datasets/lsun-car-100k ~/downloads/lsun/car_lmdb --resolution 256 --max_imgs 100000")
-    p.add_argument( "tfrecord_dir",     help = "New dataset directory to be created")
+    p.add_argument( "dataset_dir",      help = "New dataset directory to be created")
     p.add_argument( "lmdb_dir",         help = "Directory containing LMDB database")
     p.add_argument( "--resolution",     help = "Output resolution (default: 256)", type = int, default = 256)
     p.add_argument( "--max_imgs",       help = "Maximum number of images (default: none)", type = int, default = None)
 
     p = add_command("create_lsun_wide", "Create LSUN dataset with non-square aspect ratio.",
                                         "create_lsun_wide datasets/lsun-car-512x384 ~/downloads/lsun/car_lmdb --width 512 --height 384")
-    p.add_argument( "tfrecord_dir",     help = "New dataset directory to be created")
+    p.add_argument( "dataset_dir",      help = "New dataset directory to be created")
     p.add_argument( "lmdb_dir",         help = "Directory containing LMDB database")
     p.add_argument( "--width",          help = "Output width (default: 512)", type = int, default = 512)
     p.add_argument( "--height",         help = "Output height (default: 384)", type = int, default = 384)
@@ -850,35 +858,42 @@ def execute_cmdline(argv):
 
     p = add_command("create_celeba",    "Create dataset for CelebA.",
                                         "create_celeba datasets/celeba ~/downloads/celeba")
-    p.add_argument( "tfrecord_dir",     help = "New dataset directory to be created")
+    p.add_argument( "dataset_dir",      help = "New dataset directory to be created")
     p.add_argument( "celeba_dir",       help = "Directory containing CelebA")
     p.add_argument( "--cx",             help = "Center X coordinate (default: 89)", type = int, default = 89)
     p.add_argument( "--cy",             help = "Center Y coordinate (default: 121)", type = int, default = 121)
 
     p = add_command("create_celebahq",  "Create dataset for CelebA-HQ.",
                                         "create_celebahq datasets/celebahq ~/downloads/celeba ~/downloads/celeba-hq-deltas")
-    p.add_argument( "tfrecord_dir",     help="New dataset directory to be created")
-    p.add_argument( "celeba_dir",       help="Directory containing CelebA")
-    p.add_argument( "delta_dir",        help="Directory containing CelebA-HQ deltas")
-    p.add_argument( "--num_threads",    help="Number of concurrent threads (default: 4)", type = int, default = 4)
-    p.add_argument( "--num_tasks",      help="Number of concurrent processing tasks (default: 100)", type = int, default = 100)
+    p.add_argument( "dataset_dir",      help = "New dataset directory to be created")
+    p.add_argument( "celeba_dir",       help = "Directory containing CelebA")
+    p.add_argument( "delta_dir",        help = "Directory containing CelebA-HQ deltas")
+    p.add_argument( "--num_threads",    help = "Number of concurrent threads (default: 4)", type = int, default = 4)
+    p.add_argument( "--num_tasks",      help = "Number of concurrent processing tasks (default: 100)", type = int, default = 100)
 
     p = add_command("create_from_imgs", "Create dataset from a directory full of images.",
                                         "create_from_imgs datasets/mydataset myimagedir")
-    p.add_argument( "tfrecord_dir",     help = "New dataset directory to be created")
+    p.add_argument( "dataset_dir",      help = "New dataset directory to be created")
     p.add_argument( "img_dir",          help = "Directory containing the images")
+    p.add_argument( "--shuffle",        help = "Randomize image order (default: 1)", type = int, default = 1)
+    p.add_argument( "--ratio",          help = "Crop ratio (default: no crop)", type = int, default = None)
+
+    p = add_command("create_from_tfrecords", "Create dataset from a tfrecords direcotry.",
+                                        "create_from_tfrecords datasets/mydataset mytfrecorddir")
+    p.add_argument( "dataset_dir",      help = "New dataset directory to be created")
+    p.add_argument( "tfrecords_dir",    help = "Directory containing the tfrecord files")
     p.add_argument( "--shuffle",        help = "Randomize image order (default: 1)", type = int, default = 1)
     p.add_argument( "--ratio",          help = "Crop ratio (default: no crop)", type = int, default = None)
 
     p = add_command("create_from_hdf5", "Create dataset from legacy HDF5 archive.",
                                         "create_from_hdf5 datasets/celebahq ~/downloads/celeba-hq-1024x1024.h5")
-    p.add_argument( "tfrecord_dir",     help = "New dataset directory to be created")
+    p.add_argument( "dataset_dir",      help = "New dataset directory to be created")
     p.add_argument( "hdf5_filename",    help = "HDF5 archive containing the images")
     p.add_argument( "--shuffle",        help = "Randomize image order (default: 1)", type = int, default = 1)
 
     p = add_command("create_from_npy",  "Create dataset from legacy HDF5 archive.",
                                         "create_from_hdf5 datasets/celebahq ~/downloads/celeba-hq-1024x1024.h5")
-    p.add_argument( "tfrecord_dir",     help = "New dataset directory to be created")
+    p.add_argument( "dataset_dir",      help = "New dataset directory to be created")
     p.add_argument( "npy_filename",     help = "HDF5 archive containing the images")
     p.add_argument( "--shuffle",        help = "Randomize image order (default: 1)", type = int, default = 1)
 

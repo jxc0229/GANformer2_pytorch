@@ -1,8 +1,4 @@
-﻿# Miscellaneous utility classes and functions:
-### EasyDict to access variables as dict.var instead of dict["var"]
-### Logging and printing to files/screen
-### Modules management
-### File system and URL helpers
+﻿# Miscellaneous utility classes and functions
 
 import ctypes
 import fnmatch
@@ -20,18 +16,21 @@ import requests
 import html
 import hashlib
 import glob
+import tempfile
+import urllib
+import urllib.request
 import uuid
 import gdown
 
 from distutils.util import strtobool
 from typing import Any, List, Tuple, Union
 
+
 # Util classes
 # ------------------------------------------------------------------------------------------
 
-# Allows accessing variables as dict.var instead of dict["var"]
+# Convenience class that behaves like a dict but allows access with the attribute syntax
 class EasyDict(dict):
-    # Convenience class that behaves like a dict but allows access with the attribute syntax
     def __getattr__(self, name: str) -> Any:
         try:
             return self[name]
@@ -44,13 +43,10 @@ class EasyDict(dict):
     def __delattr__(self, name: str) -> None:
         del self[name]
 
-# Redirect stderr to stdout, optionally print stdout to a file,
-# and optionally force flushing on both stdout and the file
+# Redirect stderr to stdout, optionally print stdout to a file, and optionally force flushing on both stdout and the file
 class Logger(object):
-    def __init__(self, file_name: str = None, file_mode: str = "a", should_flush: bool = True,
-            screen = True):
+    def __init__(self, file_name: str = None, file_mode: str = "w", should_flush: bool = True):
         self.file = None
-        self.screen = screen
 
         if file_name is not None:
             self.file = open(file_name, file_mode)
@@ -68,26 +64,30 @@ class Logger(object):
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
         self.close()
 
-    def write(self, text: str) -> None:
-        # Write text to stdout (and a file) and optionally flush
+    # Write text to stdout (and a file) and optionally flush
+    def write(self, text: Union[str, bytes]) -> None:
+        if isinstance(text, bytes):
+            text = text.decode()
         if len(text) == 0: # workaround for a bug in VSCode debugger: sys.stdout.write(''); sys.stdout.flush() => crash
             return
 
         if self.file is not None:
             self.file.write(text)
-        if self.screen:
-            self.stdout.write(text)
+
+        self.stdout.write(text)
+
         if self.should_flush:
             self.flush()
 
+    # Flush written text to both stdout and a file, if open
     def flush(self) -> None:
-        # Flush written text to both stdout and a file, if open
         if self.file is not None:
             self.file.flush()
+
         self.stdout.flush()
 
+    # Flush, close possible files, and remove stdout/stderr mirroring
     def close(self) -> None:
-        # Flush, close possible files, and remove stdout/stderr mirroring
         self.flush()
 
         # if using multiple loggers, prevent closing in wrong order
@@ -98,6 +98,31 @@ class Logger(object):
 
         if self.file is not None:
             self.file.close()
+            self.file = None
+
+
+# Cache directories
+# ------------------------------------------------------------------------------------------
+
+_dnnlib_cache_dir = None
+
+def set_cache_dir(path: str) -> None:
+    global _dnnlib_cache_dir
+    _dnnlib_cache_dir = path
+
+def make_cache_dir_path(*paths: str) -> str:
+    if _dnnlib_cache_dir is not None:
+        return os.path.join(_dnnlib_cache_dir, *paths)
+    if 'DNNLIB_CACHE_DIR' in os.environ:
+        return os.path.join(os.environ['DNNLIB_CACHE_DIR'], *paths)
+    if 'HOME' in os.environ:
+        return os.path.join(os.environ['HOME'], '.cache', 'dnnlib', *paths)
+    if 'USERPROFILE' in os.environ:
+        return os.path.join(os.environ['USERPROFILE'], '.cache', 'dnnlib', *paths)
+    return os.path.join(tempfile.gettempdir(), '.cache', 'dnnlib', *paths)
+
+# Small util functions
+# ------------------------------------------------------------------------------------------
 
 # Convert the seconds to human readable string with days, hours, minutes and seconds
 def format_time(seconds: Union[int, float]) -> str:
@@ -124,9 +149,12 @@ def ask_yes_no(question: str) -> bool:
 # Calculate the product of the tuple elements
 def tuple_product(t: Tuple) -> Any:
     result = 1
+
     for v in t:
         result *= v
+
     return result
+
 
 _str_to_ctype = {
     "uint8": ctypes.c_ubyte,
@@ -141,8 +169,7 @@ _str_to_ctype = {
     "float64": ctypes.c_double
 }
 
-# Given a type name string (or an object having a __name__ attribute),
-# return matching Numpy and ctypes types that have the same size in bytes
+# Given a type name string (or an object having a __name__ attribute), return matching Numpy and ctypes types that have the same size in bytes
 def get_dtype_and_ctype(type_obj: Any) -> Tuple[np.dtype, Any]:
     type_str = None
 
@@ -161,7 +188,9 @@ def get_dtype_and_ctype(type_obj: Any) -> Tuple[np.dtype, Any]:
     my_ctype = _str_to_ctype[type_str]
 
     assert my_dtype.itemsize == ctypes.sizeof(my_ctype)
+
     return my_dtype, my_ctype
+
 
 def is_pickleable(obj: Any) -> bool:
     try:
@@ -171,12 +200,13 @@ def is_pickleable(obj: Any) -> bool:
     except:
         return False
 
+
 # Functionality to import modules/objects by name, and call functions by name
 # ------------------------------------------------------------------------------------------
-def get_module_from_obj_name(obj_name: str) -> Tuple[types.ModuleType, str]:
-    # Searches for the underlying module behind the name to some python object
-    # Returns the module and the object name (original name with module part removed)
 
+# Searches for the underlying module behind the name to some python object
+# Returns the module and the object name (original name with module part removed)
+def get_module_from_obj_name(obj_name: str) -> Tuple[types.ModuleType, str]:
     # allow convenience shorthands, substitute them by full names
     obj_name = re.sub("^np.", "numpy.", obj_name)
     obj_name = re.sub("^tf.", "tensorflow.", obj_name)
@@ -213,8 +243,8 @@ def get_module_from_obj_name(obj_name: str) -> Tuple[types.ModuleType, str]:
     # we are out of luck, but we have no idea why
     raise ImportError(obj_name)
 
+# Traverses the object name and returns the last (rightmost) python object
 def get_obj_from_module(module: types.ModuleType, obj_name: str) -> Any:
-    # Traverses the object name and returns the last (rightmost) python object
     if obj_name == '':
         return module
     obj = module
@@ -222,38 +252,45 @@ def get_obj_from_module(module: types.ModuleType, obj_name: str) -> Any:
         obj = getattr(obj, part)
     return obj
 
+# Finds the python object with the given name
 def get_obj_by_name(name: str) -> Any:
-    # Finds the python object with the given name
     module, obj_name = get_module_from_obj_name(name)
     return get_obj_from_module(module, obj_name)
 
+# Finds the python object with the given name and calls it as a function
 def call_func_by_name(*args, func_name: str = None, **kwargs) -> Any:
-    # Finds the python object with the given name and calls it as a function
     assert func_name is not None
     func_obj = get_obj_by_name(func_name)
     assert callable(func_obj)
     return func_obj(*args, **kwargs)
 
+# Finds the python class with the given name and constructs it with the given arguments
+def construct_class_by_name(*args, class_name: str = None, **kwargs) -> Any:
+    return call_func_by_name(*args, func_name=class_name, **kwargs)
+
+# Get the directory path of the module containing the given object name
 def get_module_dir_by_obj_name(obj_name: str) -> str:
-    # Get the directory path of the module containing the given object name
     module, _ = get_module_from_obj_name(obj_name)
     return os.path.dirname(inspect.getfile(module))
 
+# Determine whether the given object is a top-level function, i.e., defined at module scope using 'def'
 def is_top_level_function(obj: Any) -> bool:
-    # Determine whether the given object is a top-level function, i.e., defined at module scope using 'def'
     return callable(obj) and obj.__name__ in sys.modules[obj.__module__].__dict__
 
+# Return the fully-qualified name of a top-level function
 def get_top_level_function_name(obj: Any) -> str:
-    # Return the fully-qualified name of a top-level function
     assert is_top_level_function(obj)
-    return obj.__module__ + "." + obj.__name__
+    module = obj.__module__
+    if module == '__main__':
+        module = os.path.splitext(os.path.basename(sys.modules[module].__file__))[0]
+    return module + "." + obj.__name__
 
 # File system helpers
 # ------------------------------------------------------------------------------------------
 
+# List all files recursively in a given directory while ignoring given file and directory names
+# Returns list of tuples containing both absolute and relative paths
 def list_dir_recursively_with_ignore(dir_path: str, ignores: List[str] = None, add_base_to_relative: bool = False) -> List[Tuple[str, str]]:
-    # List all files recursively in a given directory while ignoring given file and directory names
-    # Returns list of tuples containing both absolute and relative paths
     assert os.path.isdir(dir_path)
     base_name = os.path.basename(os.path.normpath(dir_path))
 
@@ -283,9 +320,10 @@ def list_dir_recursively_with_ignore(dir_path: str, ignores: List[str] = None, a
 
     return result
 
+
+# Takes in a list of tuples of (src, dst) paths and copies files
+# Will create all necessary directories
 def copy_files_and_create_dirs(files: List[Tuple[str, str]]) -> None:
-    # Takes in a list of tuples of (src, dst) paths and copies files
-    # Will create all necessary directories
     for file in files:
         target_dir_name = os.path.dirname(file[1])
 
@@ -295,14 +333,15 @@ def copy_files_and_create_dirs(files: List[Tuple[str, str]]) -> None:
 
         shutil.copyfile(file[0], file[1])
 
+
 # URL helpers
 # ------------------------------------------------------------------------------------------
 
+# Determine whether the given object is a valid URL string
 def is_url(obj: Any, allow_file_urls: bool = False) -> bool:
-    # Determine whether the given object is a valid URL string
     if not isinstance(obj, str) or not "://" in obj:
         return False
-    if allow_file_urls and obj.startswith('file:///'):
+    if allow_file_urls and obj.startswith('file://'):
         return True
     try:
         res = requests.compat.urlparse(obj)
@@ -315,21 +354,46 @@ def is_url(obj: Any, allow_file_urls: bool = False) -> bool:
         return False
     return True
 
-def open_url(url: str, cache_dir: str = None, num_attempts: int = 10, verbose: bool = True) -> Any:
-    # Download the given URL and return a binary-mode file object to access the data
-    assert is_url(url, allow_file_urls=True)
+# Download the given URL and return a binary-mode file object to access the data
+def open_url(url: str, cache_dir: str = None, num_attempts: int = 10, verbose: bool = True, return_filename: bool = False, cache: bool = True) -> Any:    
     assert num_attempts >= 1
+    assert not (return_filename and (not cache))
 
-    # Handle file URLs
-    if url.startswith('file:///'):
-        return open(url[len('file:///'):], "rb")
+    # Doesn't look like an URL scheme so interpret it as a local filename
+    if not re.match('^[a-z]+://', url):
+        return url if return_filename else open(url, "rb")
+
+    # Handle file URLs.  This code handles unusual file:// patterns that
+    # arise on Windows:
+    #
+    # file:///c:/foo.txt
+    #
+    # which would translate to a local '/c:/foo.txt' filename that's
+    # invalid.  Drop the forward slash for such pathnames.
+    #
+    # If you touch this code path, you should test it on both Linux and Windows.
+    #
+    # Some internet resources suggest using urllib.request.url2pathname() but
+    # but that converts forward slashes to backslashes and this causes
+    # its own set of problems.
+    if url.startswith('file://'):
+        filename = urllib.parse.urlparse(url).path
+        if re.match(r'^/[a-zA-Z]:', filename):
+            filename = filename[1:]
+        return filename if return_filename else open(filename, "rb")
+
+    assert is_url(url)
 
     # Lookup from cache
+    if cache_dir is None:
+        cache_dir = make_cache_dir_path('downloads')
+
     url_md5 = hashlib.md5(url.encode("utf-8")).hexdigest()
-    if cache_dir is not None:
+    if cache:
         cache_files = glob.glob(os.path.join(cache_dir, url_md5 + "_*"))
         if len(cache_files) == 1:
-            return open(cache_files[0], "rb")
+            filename = cache_files[0]
+            return filename if return_filename else open(filename, "rb")
 
     if "drive.google" in url:
         filename = gdown.download(url, quiet = False)
@@ -364,6 +428,8 @@ def open_url(url: str, cache_dir: str = None, num_attempts: int = 10, verbose: b
                     if verbose:
                         print(" done")
                     break
+            except KeyboardInterrupt:
+                raise
             except:
                 if not attempts_left:
                     if verbose:
@@ -373,14 +439,17 @@ def open_url(url: str, cache_dir: str = None, num_attempts: int = 10, verbose: b
                     print(".", end="", flush=True)
 
     # Save to cache
-    if cache_dir is not None:
+    if cache:
         safe_name = re.sub(r"[^0-9a-zA-Z-._]", "_", url_name)
         cache_file = os.path.join(cache_dir, url_md5 + "_" + safe_name)
         temp_file = os.path.join(cache_dir, "tmp_" + uuid.uuid4().hex + "_" + url_md5 + "_" + safe_name)
-        os.makedirs(cache_dir, exist_ok=True)
+        os.makedirs(cache_dir, exist_ok = True)
         with open(temp_file, "wb") as f:
             f.write(url_data)
         os.replace(temp_file, cache_file) # atomic
+        if return_filename:
+            return cache_file
 
     # Return data as file object
+    assert not return_filename
     return io.BytesIO(url_data)

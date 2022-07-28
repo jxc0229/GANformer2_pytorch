@@ -1,424 +1,449 @@
-# Training loop:
-# 1. Set up the environment and data
-# 2. Build the generator (g) and discriminator (d) networks
-# 3. Manage the training process
-# 4. Run periodic evaluations on specified metrics
-# 5. Produce sample images over the course of training
+﻿# Training loop:
+# 1 Sets up the environment and data
+# 2 Builds the generator (g) and discriminator (d) networks
+# 3 Manages the training process
+# 4 Runs periodic evaluations on specified metrics
+# 5 Produces sample images over the course of training
 
-# It supports training over data in TF records as produced by prepare_data.py
-# Labels can optionally be provided although are not essential
-# If provided, image will be generated conditioned on the chosen label
-import glob
+# It supports training over an image directory dataset, prepared by prepare_data.py
+# Labels can optionally be provided although not essential
+# If provided, image will be generated conditioned on a chosen label
+
+import os
+import time
+import copy
+import json
+import pickle
+import psutil
+import PIL.Image
 import numpy as np
-import tensorflow as tf
+import torch
+import glob 
 
 import dnnlib
-import dnnlib.tflib as tflib
-from dnnlib.tflib.autosummary import autosummary
-import pretrained_networks
-
-from training import dataset as data
-from training import misc
+from torch_utils import misc as torch_misc
+from torch_utils import training_stats
+from torch_utils.ops import conv2d_gradfix
 from training import visualize
-from metrics import metric_base
+from training import misc 
+
+import loader
+from metrics import metric_main
+from metrics import metric_utils
 
 # Data processing
 # ----------------------------------------------------------------------------
 
-# Just-in-time input image processing before feeding them to the networks
-def process_reals(x, drange_data, drange_net, mirror_augment):
-    with tf.name_scope("DynamicRange"):
-        x = tf.cast(x, tf.float32)
-        x.set_shape([None, 3, None, None])
-        x = misc.adjust_dynamic_range(x, drange_data, drange_net)
-    if mirror_augment:
-        with tf.name_scope("MirrorAugment"):
-            x = tf.where(tf.random_uniform([tf.shape(x)[0]]) < 0.5, x, tf.reverse(x, [3]))
-    return x
+# Load dataset
+def load_dataset(dataset_args, batch_size, rank, num_gpus, log):
+    misc.log("Loading training set...", "white", log)
+    dataset = dnnlib.util.construct_class_by_name(**dataset_args) # subclass of training.datasetDataset
+    dataset_sampler = torch_misc.InfiniteSampler(dataset = dataset, rank = rank, num_replicas = num_gpus)
+    dataset_iter = iter(torch.utils.data.DataLoader(dataset = dataset, sampler = dataset_sampler, 
+        batch_size = batch_size//num_gpus, **dataset_args.loader_args))
+    misc.log(f"Num images: {misc.bcolored(len(dataset), 'blue')}", log = log)
+    misc.log(f"Image shape: {misc.bcolored(dataset.image_shape, 'blue')}", log = log)
+    misc.log(f"Label shape: {misc.bcolored(dataset.label_shape, 'blue')}", log = log)
+    return dataset, dataset_iter
 
-def read_data(data, name, shape, batch_gpu_in):
-    var = tf.Variable(name = name, trainable = False, initial_value = tf.zeros(shape))
-    data_write = tf.concat([data, var[batch_gpu_in:]], axis = 0)
-    data_fetch_op = tf.assign(var, data_write)
-    data_read = var[:batch_gpu_in]
-    return data_read, data_fetch_op
+# Fetch real images and their corresponding labels, and sample latents/labels
+def fetch_data(dataset, dataset_iter, input_shape, drange_net, device, batches_num, batch_size, batch_gpu):
+    with torch.autograd.profiler.record_function("data_fetch"):
+        real_img, real_c = next(dataset_iter)
+        real_img = real_img.to(device).to(torch.float32)
+        real_img = misc.adjust_range(real_img, [0, 255], drange_net).split(batch_gpu)
+        real_c = real_c.to(device).split(batch_gpu)
 
-# Scheduling and optimization
+        gen_zs = torch.randn([batches_num * batch_size, *input_shape[1:]], device = device)
+        gen_zs = [gen_z.split(batch_gpu) for gen_z in gen_zs.split(batch_size)]
+
+        gen_cs = [dataset.get_label(np.random.randint(len(dataset))) for _ in range(batches_num * batch_size)]
+        gen_cs = torch.from_numpy(np.stack(gen_cs)).pin_memory().to(device)
+        gen_cs = [gen_c.split(batch_gpu) for gen_c in gen_cs.split(batch_size)]
+
+    return real_img, real_c, gen_zs, gen_cs
+
+# Networks (construction/distribution, loading/saving, and printing)
 # ----------------------------------------------------------------------------
 
-# Evaluate time-varying training parameters
-def training_schedule(
-    sched_args,
-    cur_nimg,                      # The training length, measured in number of generated images
-    dataset,                       # The dataset object for accessing the data
-    lrate_rampup_kimg  = 0,        # Duration of learning rate ramp-up
-    tick_kimg          = 8):       # Default interval of progress snapshots
+# Construct networks
+def construct_nets(cG, cD, dataset, device, log):
+    misc.log("Constructing networks...", "white", log)
+    common_kwargs = dict(c_dim = dataset.label_dim, img_resolution = dataset.resolution, img_channels = dataset.num_channels)
+    G = dnnlib.util.construct_class_by_name(**cG, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nnnet
+    D = dnnlib.util.construct_class_by_name(**cD, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nnnet
+    Gs = copy.deepcopy(G).eval()
+    return G, D, Gs
 
-    # Initialize scheduling dictionary
-    s = dnnlib.EasyDict()
+# Distribute models onto the GPUs
+def distribute_nets(G, D, Gs, device, num_gpus, log):
+    misc.log(f"Distributing across {num_gpus} GPUs...", "white", log)
+    networks = {}
+    for name, net in [("G", G), ("D", D), (None, Gs)]: # ("G_mapping", G.mapping), ("G_synthesis", G.synthesis)
+        if (num_gpus > 1) and (net is not None) and len(list(net.parameters())) != 0:
+            net.requires_grad_(True)
+            net = torch.nn.parallel.DistributedDataParallel(net, device_ids = [device], broadcast_buffers = False, 
+                find_unused_parameters = True)
+            net.requires_grad_(False)
+        if name is not None:
+            networks[name] = net
+    return networks
 
-    # Set parameters
-    s.kimg = cur_nimg / 1000.0
-    s.tick_kimg = tick_kimg
-    s.resolution = 2 ** dataset.resolution_log2
+# Resume from existing pickle
+def load_nets(load_pkl, nets, device, log):
+    if (load_pkl is not None) and log:
+        misc.log(f"Resuming from {load_pkl}", "white", log)
+        resume_data = loader.load_network(load_pkl)
 
-    for arg in ["G_lrate", "D_lrate", "batch_size", "batch_gpu"]:
-        s[arg] = sched_args[arg]
-
-    # Learning rate optional rampup
-    if lrate_rampup_kimg > 0:
-        rampup = min(s.kimg / lrate_rampup_kimg, 1.0)
-        s.G_lrate *= rampup
-        s.D_lrate *= rampup
-
-    return s
-
-# Build two optimizers a network cN for the loss and regularization terms
-def set_optimizer(cN, lrate_in, batch_multiplier, lazy_regularization = True, clip = None):
-    args = dict(cN.opt_args)
-    args["batch_multiplier"] = batch_multiplier
-    args["learning_rate"] = lrate_in
-    if lazy_regularization:
-        mb_ratio = cN.reg_interval / (cN.reg_interval + 1)
-        args["learning_rate"] *= mb_ratio
-        if "beta1" in args: args["beta1"] **= mb_ratio
-        if "beta2" in args: args["beta2"] **= mb_ratio
-    cN.opt = tflib.Optimizer(name = f"Loss{cN.name}", clip = clip, **args)
-    cN.reg_opt = tflib.Optimizer(name = f"Reg{cN.name}", share = cN.opt, clip = clip, **args)
-
-# Create optimization operations for computing and optimizing loss, gradient norm and regularization terms
-def set_optimizer_ops(cN, lazy_regularization, no_op):
-    cN.reg_norm = tf.constant(0.0)
-    cN.trainables = cN.gpu.trainables
-
-    if cN.reg is not None:
-        if lazy_regularization:
-            cN.reg_opt.register_gradients(tf.reduce_mean(cN.reg * cN.reg_interval), cN.trainables)
-            cN.reg_norm = cN.reg_opt.norm
+        if nets is not None:
+            G, D, Gs = nets
+            for name, net in [("G", G), ("D", D), ("Gs", Gs)]:
+                torch_misc.copy_params_and_buffers(resume_data[name], net, require_all = False)
         else:
-            cN.loss += cN.reg
+            for net in ["G", "D", "Gs"]:
+                resume_data[net] = copy.deepcopy(resume_data[net]).eval().requires_grad_(False).to(device)
+            nets = (resume_data["G"], resume_data["D"], resume_data["Gs"])
 
-    cN.opt.register_gradients(tf.reduce_mean(cN.loss), cN.trainables)
-    cN.norm = cN.opt.norm
+    return nets
 
-    cN.loss_op = tf.reduce_mean(cN.loss) if cN.loss is not None else no_op
-    cN.regval_op = tf.reduce_mean(cN.reg) if cN.reg is not None else no_op
-    cN.ops = {"loss": cN.loss_op, "reg": cN.regval_op, "norm": cN.norm}
+def save_nets(G, D, Gs, cur_nimg, dataset_args, run_dir, distributed, last_snapshots, log):
+    snapshot_data = dict(dataset_args = dict(dataset_args))
 
-# Loading and logging
+    for name, net in [("G", G), ("D", D), ("Gs", Gs)]:
+        if net is not None:
+            if distributed:
+                torch_misc.assert_ddp_consistency(net, ignore_regex = r".*\.w_avg")
+            net = copy.deepcopy(net).eval().requires_grad_(False).cpu()
+        snapshot_data[name] = net
+        del net
+
+    snapshot_pkl = os.path.join(run_dir, f"network-snapshot-{cur_nimg//1000:06d}.pkl")
+    if log:
+        with open(snapshot_pkl, "wb") as f:
+            pickle.dump(snapshot_data, f)
+
+        if last_snapshots > 0:
+            misc.rm(sorted(glob.glob(os.path.join(run_dir, "network*.pkl")))[:-last_snapshots])
+
+    return snapshot_data, snapshot_pkl
+
+# Print network summary tables
+def print_nets(G, D, batch_gpu, device, log):
+    if not log:
+        return
+    z = torch.empty([batch_gpu, *G.input_shape[1:]], device = device)
+    c = torch.empty([batch_gpu, *G.cond_shape[1:]], device = device)
+    img = torch_misc.print_module_summary(G, [z, c])[0]
+    torch_misc.print_module_summary(D, [img, c])
+
+# Training and optimization
 # ----------------------------------------------------------------------------
 
-# Tracks exponential moving average: average, value -> new average
-def emaAvg(avg, value, alpha = 0.995):
-    if value is None:
-        return avg
-    if avg is None:
-        return value
-    return avg * alpha + value * (1 - alpha)
+# Initialize cuda according to command line arguments
+def init_cuda(rank, cudnn_benchmark, allow_tf32):
+    device = torch.device("cuda", rank)
+    torch.backends.cudnn.benchmark = cudnn_benchmark    # Improves training speed
+    torch.backends.cuda.matmul.allow_tf32 = allow_tf32  # Allow PyTorch to internally use tf32 for matmul
+    torch.backends.cudnn.allow_tf32 = allow_tf32        # Allow PyTorch to internally use tf32 for convolutions
+    conv2d_gradfix.enabled = True                       # Improves training speed
+    return device
 
-# Load networks from snapshot
-def load_nets(resume_pkl, lG, lD, lGs, recompile):
-    misc.log("Loading networks from %s..." % resume_pkl, "white")
-    rG, rD, rGs = pretrained_networks.load_networks(resume_pkl)
+# Setup training stages (alternating optimization of G and D, and for )
+def setup_training_stages(loss_args, G, cG, D, cD, ddp_nets, device, log):
+    misc.log("Setting up training stages...", "white", log)
+    loss = dnnlib.util.construct_class_by_name(device = device, **ddp_nets, **loss_args) # subclass of training.loss.Loss
+    stages = []
+
+    for name, net, config in [("G", G, cG), ("D", D, cD)]:
+        if config.reg_interval is None:
+            opt = dnnlib.util.construct_class_by_name(params = net.parameters(), **config.opt_args) # subclass of torch.optimOptimizer
+            stages.append(dnnlib.EasyDict(name = f"{name}_both", net = net, opt = opt, interval = 1))
+        # Lazy regularization
+        else: 
+            mb_ratio = config.reg_interval / (config.reg_interval + 1)
+            opt_args = dnnlib.EasyDict(config.opt_args)
+            opt_args.lr = opt_args.lr * mb_ratio
+            opt_args.betas = [beta ** mb_ratio for beta in opt_args.betas]
+            opt = dnnlib.util.construct_class_by_name(net.parameters(), **opt_args) # subclass of torch.optimOptimizer
+            stages.append(dnnlib.EasyDict(name = f"{name}_main", net = net, opt = opt, interval = 1))
+            stages.append(dnnlib.EasyDict(name = f"{name}_reg", net = net, opt = opt, interval = config.reg_interval))
+
+    for stage in stages:
+        stage.start_event = None
+        stage.end_event = None
+        if log:
+            stage.start_event = torch.cuda.Event(enable_timing = True)
+            stage.end_event = torch.cuda.Event(enable_timing = True)
+
+    return loss, stages
+
+# Compute gradients and update the network weights for the current training stage
+def run_training_stage(loss, stage, device, real_img, real_c, gen_z, gen_c, batch_size, batch_gpu, num_gpus):
+    # Initialize gradient accumulation
+    if stage.start_event is not None:
+        stage.start_event.record(torch.cuda.current_stream(device))
     
-    if recompile:
-        misc.log("Copying nets...")
-        lG.copy_vars_from(rG); lD.copy_vars_from(rD); lGs.copy_vars_from(rGs)
-    else:
-        lG, lD, lGs = rG, rD, rGs
-    return lG, lD, lGs
+    stage.opt.zero_grad(set_to_none = True)
+    stage.net.requires_grad_(True)
+
+    # Accumulate gradients over multiple rounds
+    for round_idx, (x, cx, z, cz) in enumerate(zip(real_img, real_c, gen_z, gen_c)):
+        sync = (round_idx == batch_size // (batch_gpu * num_gpus) - 1)
+        loss.accumulate_gradients(stage = stage.name, real_img = x, real_c = cx, 
+            gen_z = z, gen_c = cz, sync = sync, gain = stage.interval)
+
+    # Update weights
+    stage.net.requires_grad_(False)
+    with torch.autograd.profiler.record_function(stage.name + "_opt"):
+        for param in stage.net.parameters():
+            if param.grad is not None:
+                torch_misc.nan_to_num(param.grad, nan = 0, posinf = 1e5, neginf=-1e5, out = param.grad)
+        stage.opt.step()
+    
+    if stage.end_event is not None:
+        stage.end_event.record(torch.cuda.current_stream(device))
+
+# Update Gs -- the exponential moving average weights copy of G
+def update_ema_network(G, Gs, batch_size, cur_nimg, ema_kimg, ema_rampup):
+    with torch.autograd.profiler.record_function("Gs"):
+        ema_nimg = ema_kimg * 1000
+
+        if ema_rampup is not None:
+            ema_nimg = min(ema_nimg, cur_nimg * ema_rampup)
+        ema_beta = 0.5 ** (batch_size / max(ema_nimg, 1e-8))
+
+        for p_ema, p in zip(Gs.parameters(), G.parameters()):
+            p_ema.copy_(p.lerp(p_ema, ema_beta))
+
+        for b_ema, b in zip(Gs.buffers(), G.buffers()):
+            b_ema.copy_(b)
+
+# Evaluate a model over a list of metrics and report the results
+def evaluate(Gs, snapshot_pkl, metrics, eval_images_num, dataset_args, num_gpus, rank, device, log, 
+        logger = None, run_dir = None, print_progress = True):
+    for metric in metrics:
+        result_dict = metric_main.compute_metric(metric = metric, max_items = eval_images_num, 
+            G = Gs, dataset_args = dataset_args, num_gpus = num_gpus, rank = rank, device = device,
+            progress = metric_utils.ProgressMonitor(verbose = log))
+        if log:
+            metric_main.report_metric(result_dict, run_dir = run_dir, snapshot_pkl = snapshot_pkl)
+        if logger is not None:
+            logger.metrics.update(result_dict.results)
+
+# Snapshots and logging
+# ----------------------------------------------------------------------------
+
+# Initialize image grid, of both real and generated sampled
+def init_img_grid(dataset, input_shape, device, run_dir, log): 
+    if not log:
+        return None, None, None
+    grid_size, images, labels = misc.setup_snapshot_img_grid(dataset)
+    misc.save_img_grid(images, os.path.join(run_dir, "reals.png"), drange = [0, 255], grid_size = grid_size)
+    grid_z = torch.randn([labels.shape[0], *input_shape[1:]], device = device)
+    grid_c = torch.from_numpy(labels).to(device)
+    return grid_size, grid_z, grid_c
+
+# Save a snapshot of the sampled grid for the given latents/labels
+def snapshot_img_grid(Gs, drange_net, grid_z, grid_c, grid_size, batch_gpu, truncation_psi, suffix = "init"):
+    images = torch.cat([Gs(z, c, truncation_psi, noise_mode = "const").cpu() for z, c in zip(grid_z.split(batch_gpu), grid_c.split(batch_gpu))]).numpy()
+    misc.save_img_grid(images, os.path.join(run_dir, f"fakes_{suffix}.png"), drange = drange_net, grid_size = grid_size)
+
+# Initialize logs (tracking metrics, json log file, tfevent files, etc.)
+def init_logger(run_dir, log):
+    logger = dnnlib.EasyDict({
+        "collector": training_stats.Collector(regex = ".*"), 
+        "metrics": {}, 
+        "json": None, 
+        "tfevents": None
+    })
+
+    if log:
+        logger.json = open(os.path.join(run_dir, "stats.jsonl"), "wt")
+        try:
+            import torch.utils.tensorboard as tensorboard
+            logger.tfevents = tensorboard.SummaryWriter(run_dir)
+        except ImportError as err:
+            print("Skipping tfevents export:", err)
+
+    return logger
+
+# Collect statistics from each training stage across the processes/GPUs
+def collect_stats(logger, stages):
+    for stage in stages:
+        value = []
+        if (stage.start_event is not None) and (stage.end_event is not None):
+            stage.end_event.synchronize()
+            value = stage.start_event.elapsed_time(stage.end_event)
+        training_stats.report0("Timing/" + stage.name, value)
+    logger.collector.update()
+    stats = logger.collector.as_dict()
+    return stats
+
+# Update the logs (json and tfevents files) with the new info in stats
+def update_logger(logger, stats, cur_nimg, start_time):
+    timestamp = time.time()
+    if logger.json is not None:
+        fields = dict(stats, timestamp = timestamp)
+        logger.json.write(json.dumps(fields) + "\n")
+        logger.json.flush()
+    if logger.tfevents is not None:
+        global_step = int(cur_nimg / 1e3)
+        walltime = timestamp - start_time
+        for name, value in stats.items():
+            logger.tfevents.add_scalar(name, value.mean, global_step = global_step, walltime = walltime)
+        for name, value in logger.metrics.items():
+            logger.tfevents.add_scalar(f"Metrics/{name}", value, global_step = global_step, walltime = walltime)
+        logger.tfevents.flush()
 
 # Training Loop
 # ----------------------------------------------------------------------------
-# 1. Set up the environment and data
-# 2. Build the generator (g) and discriminator (d) networks
-# 3. Manage the training process
-# 4. Run periodic evaluations on specified metrics
-# 5. Produce sample images over the course of training
+# 1. Sets up the environment and data
+# 2. Builds the generator (g) and discriminator (d) networks
+# 3. Manages the training process
+# 4. Runs periodic evaluations on specified metrics
+# 5. Produces sample images over the course of training
 
 def training_loop(
-    # Configurations
-    cG = {}, cD = {},                   # Generator and Discriminator command-line arguments
-    dataset_args            = {},       # dataset.load_dataset() options
-    sched_args              = {},       # train.TrainingSchedule options
-    vis_args                = {},       # visualize.vis options
-    grid_args               = {},       # train.setup_snapshot_img_grid() options
-    metric_arg_list         = [],       # MetricGroup Options
-    tf_config               = {},       # tflib.init_tf() options
+    # General configuration
     train                   = False,    # Training mode
     eval                    = False,    # Evaluation mode
-    vis                     = False,    # Visualization mode
+    vis                     = False,    # Visualization mode        
+    run_dir                 = ".",      # Output directory
+    num_gpus                = 1,        # Number of GPUs participating in the training
+    rank                    = 0,        # Rank of the current process in [0, num_gpus]
+    cG                      = {},       # Options for generator network
+    cD                      = {},       # Options for discriminator network
     # Data
-    data_dir                = None,     # Directory to load datasets from
-    total_kimg              = 25000,    # Total length of the training, measured in thousands of real images
-    mirror_augment          = False,    # Enable mirror augmentation?
+    dataset_args            = {},       # Options for training set
     drange_net              = [-1,1],   # Dynamic range used when feeding image data to the networks
     # Optimization
-    batch_repeats           = 4,        # Number of batches to run before adjusting training parameters
-    lazy_regularization     = True,     # Perform regularization as a separate training step?
-    smoothing_kimg          = 10.0,     # Half-life of the running average of generator weights
-    clip                    = None,     # Clip gradients threshold
-    # Resumption
-    resume_pkl              = None,     # Network pickle to resume training from, None = train from scratch.
-    resume_kimg             = 0.0,      # Assumed training progress at the beginning
-                                        # Affects reporting and training schedule
-    resume_time             = 0.0,      # Assumed wallclock time at the beginning, affects reporting
-    recompile               = False,    # Recompile network from source code (otherwise loads from snapshot)
+    loss_args               = {},       # Options for loss function
+    total_kimg              = 25000,    # Total length of the training, measured in thousands of real images
+    batch_size              = 4,        # Total batch size for one training iteration. Can be larger than batch_gpu * num_gpus
+    batch_gpu               = 4,        # Number of samples processed at a time by one GPU
+    ema_kimg                = 10.0,     # Half-life of the exponential moving average (EMA) of generator weights
+    ema_rampup              = None,     # EMA ramp-up coefficient
+    cudnn_benchmark         = True,     # Enable torch.backends.cudnnbenchmark?
+    allow_tf32              = False,    # Enable torch.backends.cuda.matmul.allow_tf32 and torch.backends.cudnnallow_tf32?
     # Logging
-    summarize               = True,     # Create TensorBoard summaries
-    save_tf_graph           = False,    # Include full TensorFlow computation graph in the tfevents file?
-    save_weight_histograms  = False,    # Include weight histograms in the tfevents file?
+    resume_pkl              = None,     # Network pickle to resume training from
+    resume_kimg             = 0.0,      # Assumed training progress at the beginning
+                                        # Affects reporting and training schedule    
+    kimg_per_tick           = 8,        # Progress snapshot interval
     img_snapshot_ticks      = 3,        # How often to save image snapshots? None = disable
-    network_snapshot_ticks  = 3,        # How often to save network snapshots? None = only save networks-final.pkl
+    network_snapshot_ticks  = 3,        # How often to save network snapshots? None = disable    
     last_snapshots          = 10,       # Maximal number of prior snapshots to save
+    printname               = "",       # Experiment name for logging
+    # Evaluation
+    vis_args                = {},       # Options for vis.vis
+    metrics                 = [],       # Metrics to evaluate during training
     eval_images_num         = 50000,    # Sample size for the metrics
-    printname               = ""):       # Experiment name for logging
+    truncation_psi          = 0.7       # Style strength multiplier for the truncation trick (used for visualizations only)
+):  
+    # Initialize
+    start_time = time.time()
+    device = init_cuda(rank, cudnn_benchmark, allow_tf32)
+    log = (rank == 0)
 
-    # Initialize dnnlib and TensorFlow
-    tflib.init_tf(tf_config)
-    num_gpus = dnnlib.submit_config.num_gpus
-    cG.name, cD.name = "g", "d"
+    dataset, dataset_iter = load_dataset(dataset_args, batch_size, rank, num_gpus, log) # Load training set
 
-    # Load dataset, configure training scheduler and metrics object
-    dataset = data.load_dataset(data_dir = dnnlib.convert_path(data_dir), verbose = True, **dataset_args)
-    sched = training_schedule(sched_args, cur_nimg = total_kimg * 1000, dataset = dataset)
-    metrics = metric_base.MetricGroup(metric_arg_list)
-
-    # Construct or load networks
-    with tf.device("/gpu:0"):
-        no_op = tf.no_op()
-        G, D, Gs = None, None, None
-        if resume_pkl is None or recompile:
-            misc.log("Constructing networks...", "white")
-            G = tflib.Network("G", num_channels = dataset.shape[0], resolution = dataset.shape[1], 
-                label_size = dataset.label_size, **cG.args)
-            D = tflib.Network("D", num_channels = dataset.shape[0], resolution = dataset.shape[1], 
-                label_size = dataset.label_size, **cD.args)
-            Gs = G.clone("Gs")
-        if resume_pkl is not None:
-            G, D, Gs = load_nets(resume_pkl, G, D, Gs, recompile)
-
-    G.print_layers()
-    D.print_layers()
-
-    # Train/Evaluate/Visualize
-    # Labels are optional but not essential
-    grid_size, grid_reals, grid_labels = misc.setup_snapshot_img_grid(dataset, **grid_args)
-    misc.save_img_grid(grid_reals, dnnlib.make_run_dir_path("reals.png"), drange = dataset.dynamic_range, grid_size = grid_size)
-    grid_latents = np.random.randn(np.prod(grid_size), *G.input_shape[1:])
+    nets = construct_nets(cG, cD, dataset, device, log) if train else None        # Construct networks
+    G, D, Gs = load_nets(resume_pkl, nets, device, log)                           # Resume from existing pickle
+    print_nets(G, D, batch_gpu, device, log)                                      # Print network summary tables
 
     if eval:
-        # Save a snapshot of the current network to evaluate
-        pkl = dnnlib.make_run_dir_path("network-eval-snapshot-%06d.pkl" % resume_kimg)
-        misc.save_pkl((G, D, Gs), pkl)
+        misc.log("Run evaluation...", log = log)
+        evaluate(Gs, resume_pkl, metrics, eval_images_num, dataset_args, num_gpus, rank, device, log)
 
-        misc.log("Run evaluation...")
-        metric = metrics.run(pkl, num_imgs = eval_images_num, run_dir = dnnlib.make_run_dir_path(),
-            data_dir = dnnlib.convert_path(data_dir), num_gpus = num_gpus, ratio = dataset.ratio, 
-            tf_config = tf_config, eval_mod = True, mirror_augment = mirror_augment)  
-
-    if vis:
+    if vis and log:
         misc.log("Produce visualizations...")
-        visualize.vis(Gs, dataset, batch_size = sched.batch_gpu,
-            drange_net = drange_net, ratio = dataset.ratio, **vis_args)
+        visualize.vis(Gs, dataset, device, batch_gpu, drange_net = drange_net, ratio = dataset.ratio, 
+            truncation_psi = truncation_psi, **vis_args)
 
     if not train:
-        dataset.close()
         exit()
 
-    # Setup training inputs
-    misc.log("Building TensorFlow graph...", "white")
-    with tf.name_scope("Inputs"), tf.device("/cpu:0"):
-        lrate_in_g           = tf.placeholder(tf.float32, name = "lrate_in_g", shape = [])
-        lrate_in_d           = tf.placeholder(tf.float32, name = "lrate_in_d", shape = [])
-        step                 = tf.placeholder(tf.int32, name = "step", shape = [])
-        batch_size_in        = tf.placeholder(tf.int32, name = "batch_size_in", shape=[])
-        batch_gpu_in         = tf.placeholder(tf.int32, name = "batch_gpu_in", shape=[])
-        batch_multiplier     = batch_size_in // (batch_gpu_in * num_gpus)
-        beta                 = 0.5 ** tf.div(tf.cast(batch_size_in, tf.float32), 
-                                smoothing_kimg * 1000.0) if smoothing_kimg > 0.0 else 0.0
+    nets = distribute_nets(G, D, Gs, device, num_gpus, log)                                   # Distribute networks across GPUs
+    loss, stages = setup_training_stages(loss_args, G, cG, D, cD, nets, device, log)          # Setup training stages (losses and optimizers)
+    grid_size, grid_z, grid_c = init_img_grid(dataset, G.input_shape, device, run_dir, log)   # Initialize an image grid    
+    logger = init_logger(run_dir, log)                                                        # Initialize logs
 
-    # Set optimizers
-    for cN, lr in [(cG, lrate_in_g), (cD, lrate_in_d)]:
-        set_optimizer(cN, lr, batch_multiplier, lazy_regularization, clip)
+    # Train
+    misc.log(f"Training for {total_kimg} kimg...", "white", log)    
+    cur_nimg, cur_tick, batch_idx = int(resume_kimg * 1000), 0, 0
+    tick_start_nimg, tick_start_time = cur_nimg, time.time()
+    stats = None
 
-    # Build training graph for each GPU
-    data_fetch_ops = []
-    for gpu in range(num_gpus):
-        with tf.name_scope("GPU%d" % gpu), tf.device("/gpu:%d" % gpu):
+    while True:
+        # Fetch training data
+        real_img, real_c, gen_zs, gen_cs = fetch_data(dataset, dataset_iter, G.input_shape, drange_net, 
+            device, len(stages), batch_size, batch_gpu)
 
-            # Create GPU-specific shadow copies of G and D
-            for cN, N in [(cG, G), (cD, D)]:
-                cN.gpu = N if gpu == 0 else N.clone(N.name + "_shadow")
-            Gs_gpu = Gs if gpu == 0 else Gs.clone(Gs.name + "_shadow")
+        # Execute training stages
+        for stage, gen_z, gen_c in zip(stages, gen_zs, gen_cs):
+            if batch_idx % stage.interval != 0:
+                continue
+            run_training_stage(loss, stage, device, real_img, real_c, gen_z, gen_c, batch_size, batch_gpu, num_gpus)
 
-            # Fetch training data via temporary variables
-            with tf.name_scope("DataFetch"):
-                reals, labels = dataset.get_batch_tf()
-                reals = process_reals(reals, dataset.dynamic_range, drange_net, mirror_augment)
-                reals, reals_fetch = read_data(reals, "reals",
-                    [sched.batch_gpu] + dataset.shape, batch_gpu_in)
-                labels, labels_fetch = read_data(labels, "labels",
-                    [sched.batch_gpu, dataset.label_size], batch_gpu_in)
-                data_fetch_ops += [reals_fetch, labels_fetch]
+        # Update Gs
+        update_ema_network(G, Gs, batch_size, cur_nimg, ema_kimg, ema_rampup)
 
-            # Evaluate loss functions
-            with tf.name_scope("G_loss"):
-                cG.loss, cG.reg = dnnlib.util.call_func_by_name(G = cG.gpu, D = cD.gpu, dataset = dataset,
-                    reals = reals, batch_size = batch_gpu_in, **cG.loss_args)
-
-            with tf.name_scope("D_loss"):
-                cD.loss, cD.reg = dnnlib.util.call_func_by_name(G = cG.gpu, D = cD.gpu, dataset = dataset,
-                    reals = reals, labels = labels, batch_size = batch_gpu_in, **cD.loss_args)
-
-            for cN in [cG, cD]:
-                set_optimizer_ops(cN, lazy_regularization, no_op)
-
-    # Setup training ops
-    data_fetch_op = tf.group(*data_fetch_ops)
-    for cN in [cG, cD]:
-        cN.train_op = cN.opt.apply_updates()
-        cN.reg_op = cN.reg_opt.apply_updates(allow_no_op = True)
-    Gs_update_op = Gs.setup_as_moving_average_of(G, beta = beta)
-
-    # Finalize graph
-    with tf.device("/gpu:0"):
-        try:
-            peak_gpu_mem_op = tf.contrib.memory_stats.MaxBytesInUse()
-        except tf.errors.NotFoundError:
-            peak_gpu_mem_op = tf.constant(0)
-    tflib.init_uninitialized_vars()
-
-    # Tensorboard summaries
-    if summarize:
-        misc.log("Initializing logs...", "white")
-        summary_log = tf.summary.FileWriter(dnnlib.make_run_dir_path())
-        if save_tf_graph:
-            summary_log.add_graph(tf.get_default_graph())
-        if save_weight_histograms:
-            G.setup_weight_histograms(); D.setup_weight_histograms()
-
-    # Initialize training
-    misc.log("Training for %d kimg..." % total_kimg, "white")
-    dnnlib.RunContext.get().update("", cur_epoch = resume_kimg, max_epoch = total_kimg)
-    maintenance_time = dnnlib.RunContext.get().get_last_update_interval()
-
-    cur_tick, running_mb_counter = -1, 0
-    cur_nimg = int(resume_kimg * 1000)
-    tick_start_nimg = cur_nimg
-    for cN in [cG, cD]:
-        cN.lossvals_agg = {k: None for k in ["loss", "reg", "norm", "reg_norm"]}
-        cN.opt.reset_optimizer_state()
-
-    # Training loop
-    while cur_nimg < total_kimg * 1000:
-        if dnnlib.RunContext.get().should_stop():
-            break
-
-        # Choose training parameters and configure training ops
-        sched = training_schedule(sched_args, cur_nimg = cur_nimg, dataset = dataset)
-        assert sched.batch_size % (sched.batch_gpu * num_gpus) == 0
-        dataset.configure(sched.batch_gpu)
-
-        # Run training ops
-        feed_dict = {
-            lrate_in_g: sched.G_lrate,
-            lrate_in_d: sched.D_lrate,
-            batch_size_in: sched.batch_size,
-            batch_gpu_in: sched.batch_gpu,
-            step: sched.kimg
-        }
-
-        # Several iterations before updating training parameters
-        for _repeat in range(batch_repeats):
-            rounds = range(0, sched.batch_size, sched.batch_gpu * num_gpus)
-            for cN in [cG, cD]:
-                cN.run_reg = lazy_regularization and (running_mb_counter % cN.reg_interval == 0)
-            cur_nimg += sched.batch_size
-            running_mb_counter += 1
-
-            for cN in [cG, cD]:
-                cN.lossvals = {k: None for k in ["loss", "reg", "norm", "reg_norm"]}
-
-            # Gradient accumulation
-            for _round in rounds:
-                cG.lossvals.update(tflib.run([cG.train_op, cG.ops], feed_dict)[1])
-                if cG.run_reg:
-                    _, cG.lossvals["reg_norm"] = tflib.run([cG.reg_op, cG.reg_norm], feed_dict)
-
-                tflib.run(data_fetch_op, feed_dict)
-
-                cD.lossvals.update(tflib.run([cD.train_op, cD.ops], feed_dict)[1])
-                if cD.run_reg:
-                    _, cD.lossvals["reg_norm"] = tflib.run([cD.reg_op, cD.reg_norm], feed_dict)
-
-            tflib.run([Gs_update_op], feed_dict)
-
-            # Track loss statistics
-            for cN in [cG, cD]:
-                for k in cN.lossvals_agg:
-                    cN.lossvals_agg[k] = emaAvg(cN.lossvals_agg[k], cN.lossvals[k])
+        # Update state
+        cur_nimg += batch_size
+        batch_idx += 1
 
         # Perform maintenance tasks once per tick
         done = (cur_nimg >= total_kimg * 1000)
-        if cur_tick < 0 or cur_nimg >= tick_start_nimg + sched.tick_kimg * 1000 or done:
-            cur_tick += 1
-            tick_kimg = (cur_nimg - tick_start_nimg) / 1000.0
-            tick_start_nimg = cur_nimg
-            tick_time = dnnlib.RunContext.get().get_time_since_last_update()
-            total_time = dnnlib.RunContext.get().get_time_since_start() + resume_time
+        if (not done) and (cur_tick != 0) and (cur_nimg < tick_start_nimg + kimg_per_tick * 1000):
+            continue
 
-            # Report progress
-            print(("tick %s kimg %s   loss/reg: G (%s %s) D (%s %s)   grad norms: G (%s %s) D (%s %s)   " + 
-                   "time %s sec/kimg %s maxGPU %sGB %s") % (
-                misc.bold("%-5d" % autosummary("Progress/tick", cur_tick)),
-                misc.bcolored(f"{autosummary('Progress/kimg', cur_nimg / 1000.0):>8.1f}", "red"),
-                misc.bcolored(f"{(cG.lossvals_agg['loss'] or 0):>6.3f}", "blue"),
-                misc.bold(f"{(cG.lossvals_agg['reg'] or 0):>6.3f}"),
-                misc.bcolored(f"{(cD.lossvals_agg['loss'] or 0):>6.3f}", "blue"),
-                misc.bold(f"{(cD.lossvals_agg['reg'] or 0):>6.3f}"),
-                misc.cond_bcolored(cG.lossvals_agg["norm"], 20.0, "red"),
-                misc.cond_bcolored(cG.lossvals_agg["reg_norm"], 20.0, "red"),
-                misc.cond_bcolored(cD.lossvals_agg["norm"], 20.0, "red"),
-                misc.cond_bcolored(cD.lossvals_agg["reg_norm"], 20.0, "red"),
-                misc.bold("%-10s" % dnnlib.util.format_time(autosummary("Timing/total_sec", total_time))),
-                f"{autosummary('Timing/sec_per_kimg', tick_time / tick_kimg):>7.2f}",
-                f"{autosummary('Resources/peak_gpu_mem_gb', peak_gpu_mem_op.eval() / 2**30):>4.1f}",
-                misc.bold(printname)))
+        # Print status line and accumulate the info in logger.collector
+        tick_end_time = time.time()
+        if stats is not None:
+            default = dnnlib.EasyDict({'mean': -1})
+            fields = []
+            fields.append("tick " + misc.bold(f"{training_stats.report0('Progress/tick', cur_tick):<5d}"))
+            fields.append("kimg " + misc.bcolored(f"{training_stats.report0('Progress/kimg', cur_nimg / 1e3):<8.1f}", "red"))
+            fields.append("")
+            fields.append("loss/reg: G (" + misc.bcolored(f"{stats.get('Loss/G/loss', default).mean:>6.3f}", "blue"))
+            fields.append(misc.bold(f"{stats.get('Loss/G/reg', default).mean:>6.3f}") + ")")
+            fields.append("D "+ misc.bcolored(f"({stats.get('Loss/D/loss', default).mean:>6.3f}", "blue"))
+            fields.append(misc.bold(f"{stats.get('Loss/D/reg', default).mean:>6.3f}") + ")")
+            fields.append("")
+            fields.append("time " + misc.bold(f"{dnnlib.util.format_time(training_stats.report0('Timing/total_sec', tick_end_time - start_time)):<12s}"))
+            fields.append(f"sec/kimg {training_stats.report0('Timing/sec_per_kimg', (tick_end_time - tick_start_time) / (cur_nimg - tick_start_nimg) * 1e3):<7.2f}")
+            fields.append(f"mem: GPU {training_stats.report0('Resources/cpu_mem_gb', psutil.Process(os.getpid()).memory_info().rss / 2**30):<6.2f}")
+            fields.append(f"CPU {training_stats.report0('Resources/peak_gpu_mem_gb', torch.cuda.max_memory_allocated(device) / 2**30):<6.2f}")
+            fields.append(misc.bold(printname))
+            torch.cuda.reset_peak_memory_stats()
+            training_stats.report0('Timing/total_hours', (tick_end_time - start_time) / (60 * 60))
+            training_stats.report0('Timing/total_days', (tick_end_time - start_time) / (24 * 60 * 60))
+            misc.log(" ".join(fields), log = log)
 
-            autosummary("Timing/total_hours", total_time / (60.0 * 60.0))
-            autosummary("Timing/total_days", total_time / (24.0 * 60.0 * 60.0))
+        # Save image snapshot
+        if log and (img_snapshot_ticks is not None) and (done or cur_tick % img_snapshot_ticks == 0):
+            visualize.vis(Gs, dataset, device, batch_gpu, training = True,
+                step = cur_nimg // 1000, grid_size = grid_size, latents = grid_z, 
+                labels = grid_c, drange_net = drange_net, ratio = dataset.ratio, **vis_args)
 
-            # Save snapshots
-            if img_snapshot_ticks is not None and (cur_tick % img_snapshot_ticks == 0 or done):
-                visualize.vis(Gs, dataset, batch_size = sched.batch_gpu, training = True,
-                    step = cur_nimg // 1000, grid_size = grid_size, latents = grid_latents, 
-                    labels = grid_labels, drange_net = drange_net, ratio = dataset.ratio, **vis_args)
+        # Save network snapshot
+        if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
+            snapshot_data, snapshot_pkl = save_nets(G, D, Gs, cur_nimg, dataset_args, run_dir, num_gpus > 1, last_snapshots, log)
 
-            if network_snapshot_ticks is not None and (cur_tick % network_snapshot_ticks == 0 or done):
-                pkl = dnnlib.make_run_dir_path("network-snapshot-%06d.pkl" % (cur_nimg // 1000))
-                misc.save_pkl((G, D, Gs), pkl)
+            # Evaluate metrics
+            evaluate(snapshot_data["Gs"], snapshot_pkl, metrics, eval_images_num,
+                dataset_args, num_gpus, rank, device, log, logger, run_dir)
+            del snapshot_data
 
-                if cur_tick % network_snapshot_ticks == 0 or done:
-                    metric = metrics.run(pkl, num_imgs = eval_images_num, run_dir = dnnlib.make_run_dir_path(),
-                        data_dir = dnnlib.convert_path(data_dir), num_gpus = num_gpus, ratio = dataset.ratio, 
-                        tf_config = tf_config, mirror_augment = mirror_augment)
+        # Collect stats and update logs
+        stats = collect_stats(logger, stages)
+        update_logger(logger, stats, cur_nimg, start_time)
 
-                if last_snapshots > 0:
-                    misc.rm(sorted(glob.glob(dnnlib.make_run_dir_path("network*.pkl")))[:-last_snapshots])
+        cur_tick += 1
+        tick_start_nimg, tick_start_time = cur_nimg, time.time()
+        maintenance_time = tick_start_time - tick_end_time
+        if done:
+            break
 
-            # Update summaries and RunContext
-            if summarize:
-                metrics.update_autosummaries()
-                tflib.autosummary.save_summaries(summary_log, cur_nimg)
-
-            dnnlib.RunContext.get().update(None, cur_epoch = cur_nimg // 1000, max_epoch = total_kimg)
-            maintenance_time = dnnlib.RunContext.get().get_last_update_interval() - tick_time
-
-    # Save final snapshot
-    misc.save_pkl((G, D, Gs), dnnlib.make_run_dir_path("network-final.pkl"))
-
-    # All done
-    if summarize:
-        summary_log.close()
-    dataset.close()
+    # Done
+    misc.log("Done!", "blue")

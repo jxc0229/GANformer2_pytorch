@@ -1,36 +1,24 @@
-# Inception Score (IS).
+﻿# Compute the Inception Score (IS) metric
+
 import numpy as np
-import tensorflow as tf
-import dnnlib.tflib as tflib
-import glob
-import PIL.Image
+from . import metric_utils
 
-from metrics import metric_base
-from training import misc
+def compute_is(opts, num_splits):
+    # Direct TorchScript translation of http://download.tensorflow.org/models/image/imagenet/inception-2015-12-05.tgz
+    detector_url = "https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada-pytorch/pretrained/metrics/inception-2015-12-05.pt"
+    detector_kwargs = dict(no_output_bias = True) # Match the original implementation by not applying bias in the softmax layer.
 
-class IS(metric_base.MetricBase):
-    def __init__(self, num_splits, batch_per_gpu, **kwargs):
-        super().__init__(**kwargs)
-        self.num_splits = num_splits
-        self.batch_per_gpu = batch_per_gpu
+    gen_probs = metric_utils.compute_feature_stats_for_generator(
+        opts = opts, detector_url = detector_url, detector_kwargs = detector_kwargs,
+        capture_all = True).get_all()
 
-    def _evaluate(self, Gs, Gs_kwargs, num_gpus, num_imgs, ratio = 1.0, paths = None, **kwargs):
-        batch_size = num_gpus * self.batch_per_gpu
-        featurizer = misc.load_pkl("http://d36zk2xti64re0.cloudfront.net/stylegan1/networks/metrics/inception_v3_softmax.pkl")
+    if opts.rank != 0:
+        return float("nan"), float("nan")
 
-        if paths is not None:
-            # Extract features for local sample image files (paths)
-            feats = self._paths_to_feats(paths, featurizer, batch_size, ratio, num_gpus, num_imgs)
-        else:
-            # Extract features for newly generated fake images
-            feats = self._gen_feats(Gs, featurizer, batch_size, ratio, num_imgs, num_gpus, Gs_kwargs)
-
-        # Compute IS
-        scores = []
-        for i in range(self.num_splits):
-            part = feats[i * num_imgs // self.num_splits : (i + 1) * num_imgs // self.num_splits]
-            kl = part * (np.log(part) - np.log(np.expand_dims(np.mean(part, 0), 0)))
-            kl = np.mean(np.sum(kl, axis = 1))
-            scores.append(np.exp(kl))
-        self._report_result(np.mean(scores), suffix = "_mean")
-        self._report_result(np.std(scores), suffix = "_std")
+    scores = []
+    for i in range(num_splits):
+        part = gen_probs[i * opts.max_items // num_splits : (i + 1) * opts.max_items // num_splits]
+        kl = part * (np.log(part) - np.log(np.mean(part, axis = 0, keepdims = True)))
+        kl = np.mean(np.sum(kl, axis = 1))
+        scores.append(np.exp(kl))
+    return float(np.mean(scores)), float(np.std(scores))
